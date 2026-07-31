@@ -1,4 +1,4 @@
-# arr-dashboard
+# Starrboard
 
 A self-healing automation pipeline for a home media server (Sonarr, Radarr, and a download client). Three stdlib-only Python programs, no pip dependencies, running unattended on cron/systemd.
 
@@ -32,7 +32,7 @@ This project sits on top of Sonarr, Radarr, and qBittorrent, it doesn't run them
 
    ```
    git clone <this-repo-url>
-   cd arr-dashboard
+   cd starrboard
    ```
 
 2. Copy the example environment file and fill in your real values:
