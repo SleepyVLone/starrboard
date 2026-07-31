@@ -10,6 +10,16 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.0.1
+
+**Fixed: code comments referenced real, specific show titles and an indexer by name.**
+
+Several bug-report-style comments documenting real problems hit during development named the actual show and, in one case, the indexer involved. None of that changes what the code does, but it's an unnecessary and pointless thing to have sitting in a public repo, so every one of those references was swapped for a generic description of the same bug pattern (a TV episode, an anime season, a multi-episode batch, and so on), with the technical detail that actually matters (filenames, timings, thresholds) left untouched.
+
+**Fixed: a handful of American spellings in comments and documentation.**
+
+`monopolize`/`monopolizing` to `monopolise`/`monopolising`, `judgment` to `judgement`, and `centering`/`centered` to `centring`/`centred` in the changelog. Left every CSS/JS spelling that has to stay American alone (`color`, `center`, and the `behavior`/`block` keys `scrollIntoView` requires), since those aren't a style choice, they're what the browser actually expects.
+
 ## v1.0.0
 
 **Added: first public release, split out of the private production copy.**
@@ -28,6 +38,6 @@ The dashboard's live command-queue view and its health card previously only repo
 
 A blank required environment variable now logs a clear warning naming it, instead of every page just silently reading "Unreachable" with no explanation of why.
 
-**Fixed: the Calendar page's nav bar was missing the Library link entirely**, and separately, the whole top nav bar visibly shifted position when moving from the Overview page to any other page. The first was a missing link in that one page's markup; the second was `justify-content: space-between` centering the nav based on the width of whatever sat to its left and right, which differed page to page. The nav is now absolutely centered against the bar itself, so its position can never depend on its neighbours again.
+**Fixed: the Calendar page's nav bar was missing the Library link entirely**, and separately, the whole top nav bar visibly shifted position when moving from the Overview page to any other page. The first was a missing link in that one page's markup; the second was `justify-content: space-between` centring the nav based on the width of whatever sat to its left and right, which differed page to page. The nav is now absolutely centred against the bar itself, so its position can never depend on its neighbours again.
 
 **Fixed: Library and Add pages showed a raw Python exception string on failure** (e.g. `urlopen error [Errno 61] Connection refused`) instead of a plain-English message, and the Add page's quality/folder dropdowns had no error handling at all, so a failed fetch there silently left them empty.

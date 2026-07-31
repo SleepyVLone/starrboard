@@ -29,8 +29,9 @@
 # 3) Malicious/disguised executables: a release whose entire downloaded item is
 #    a single .exe/.scr/.bat/etc file rather than a real video -- a
 #    disguised-malware pattern, not a legitimate release regardless of file
-#    size. Hit with 'Silo S03E02 ... .exe' (1.2GB, plausible size for a real
-#    episode, but TV/movie releases are never shipped as a bare executable).
+#    size. Hit live with a TV episode release padded out to a bare .exe
+#    (1.2GB, plausible size for a real episode, but TV/movie releases are
+#    never shipped as a bare executable).
 #    Deleted from disk directly, blocklisted, fresh search triggered. Never
 #    inspects or runs the file -- detection is path-based only.
 #
@@ -48,8 +49,9 @@
 #      plain SxxEyy/Sx-yy pattern in the filename gives a different, specific
 #      (season, episode) than Sonarr's guess, AND that specific episode doesn't
 #      already have a file. Only then is the episode ID override applied --
-#      this is exactly the bug class hit with Psycho-Pass S2 (`S2 - 01.mkv`
-#      misread as season 1) and is safe because it only fires when the
+#      this is exactly the bug class hit live when a release's filename used
+#      `S2 - 01.mkv` instead of the usual `S02E01` pattern and got misread as
+#      season 1, and is safe because it only fires when the
 #      regex-derived target is both different from Sonarr's guess and
 #      genuinely missing, never overriding a legitimate "not an upgrade" call.
 #    Radarr gets Tier 1 only -- movie identity isn't safely guessable from a
@@ -73,9 +75,9 @@
 #    episodes as one undivided file) and/or promotional extras ("PV01.mkv",
 #    "NCOP.mkv", etc.) instead of one file per episode. Sonarr can never
 #    auto-match these to a single episode number -- not a numbering-scheme
-#    mismatch fixable by regex like the JoJo case in rescue_stuck_imports,
-#    but a fundamentally different file-per-episode structure. Hit live with
-#    "Tondemo Skill de Isekai Hourou Meshi S2 Vol 1-2" (BDRip, Vol 1/Vol 2 +
+#    mismatch fixable by regex like the similar case described in
+#    rescue_stuck_imports below, but a fundamentally different file-per-episode
+#    structure. Hit live with an anime season's BDRip batch (Vol 1/Vol 2 +
 #    6 PV files, zero real per-episode files in the release at all).
 #    Conservative by design: only fires when EVERY file Sonarr rejected with
 #    "Invalid season or episode" matches a known bonus/disc-dump filename
@@ -86,8 +88,8 @@
 # 8) Recovered blocklist entries: a release blocklisted while genuinely dead
 #    (0 seeds) stays permanently unusable even if real seeders show up
 #    later -- Sonarr/Radarr refuse a blocklisted release outright without
-#    ever re-checking its current seeder count (hit live: Teen Titans
-#    S01E04's FLUX release was blocklisted while seedless, then had 13
+#    ever re-checking its current seeder count (hit live: one TV episode's
+#    release was blocklisted while seedless, then had 13
 #    healthy seeders weeks later and just kept getting rejected as "Release
 #    is blocklisted" forever). This removes blocklist entries for content
 #    that's STILL missing a file, so the next automatic search re-evaluates
@@ -104,7 +106,7 @@
 #    check's 0-seed-stall watchdog directly -- the watchdog blocklists a
 #    genuinely dead release, this recovers it minutes later since the
 #    episode's still missing, Sonarr re-grabs the same dead release, the
-#    watchdog blocklists it again. Hit live with Link Click S01E07-10
+#    watchdog blocklists it again. Hit live with a multi-episode batch
 #    cycling grab/fail every 20-30 minutes for hours straight before this
 #    was caught. A release that's actually recovered has plenty of real-world
 #    time to still be there a day later.
@@ -114,13 +116,13 @@
 #    on disk -- Sonarr/Radarr then sit forever at "Downloaded - Waiting to
 #    Import" / "No files found are eligible for import", since as far as
 #    they know the download genuinely finished. Discovered live with a 23GB
-#    Attack on Titan batch: forcing a qBittorrent recheck immediately dropped
+#    TV batch: forcing a qBittorrent recheck immediately dropped
 #    it from 100% to 0% and moved it back to the incomplete folder, proving
 #    the "complete" state was stale, not real (root cause unconfirmed --
 #    ruled out disk space exhaustion, a qBittorrent/gluetun container
 #    restart, and qBittorrent's own ratio-limit action, which is Pause here,
 #    not delete). Almost certainly also explains two earlier mystery
-#    failures (Death Note and Royal Tutor batches both went from grabbed to
+#    failures (two other batches both went from grabbed to
 #    entirely gone with no script of ours touching them). Only fires after a
 #    download has sat stuck this way for 45+ minutes (its own persisted
 #    state, /tmp/arr-queue-cleaner-phantom-state.json) and qBittorrent still
@@ -136,13 +138,13 @@
 #     content but has NEVER had a single grab or import, days after being
 #     added. Nothing else here would ever catch this -- it produces no queue
 #     entry, no history, no error, it just silently never gets searched
-#     successfully. Discovered live: The Grand Tour (2016) was added with
-#     seriesType 'anime' and an anime root folder/quality profile by mistake
-#     (it's a live-action car show) -- anime-type release parsing never
+#     successfully. Discovered live: a live-action car-review series was added
+#     with seriesType 'anime' and an anime root folder/quality profile by
+#     mistake -- anime-type release parsing never
 #     matches normal SxxEyy-named releases, so it sat at 0 episodes for a full
 #     week with zero errors anywhere until a human noticed it missing from
 #     Jellyfin. Deliberately flag-only, never auto-fixes: the correct fix
-#     (seriesType / root folder / quality profile) needs human judgment --
+#     (seriesType / root folder / quality profile) needs human judgement --
 #     blindly flipping seriesType risks breaking a show that's genuinely
 #     anime. Deduped via its own ledger so a still-unresolved item is reported
 #     once, not every 30 minutes forever.
@@ -168,8 +170,8 @@ DEAD_MIN_AGE_SECONDS = 20 * 60
 # Deliberately excludes "queuedDL" (waiting on the concurrency cap for a free
 # slot -- expected, not dead) and any "...UP" state (already finished). Also
 # includes "stoppedDL": discovered live that several genuinely-dead torrents
-# (Tsurune episodes with zero seeders confirmed by their own tracker, not
-# just our client) end up sitting in "stoppedDL" rather than actively
+# (a batch of anime episodes with zero seeders confirmed by their own
+# tracker, not just our client) end up sitting in "stoppedDL" rather than actively
 # retrying in "stalledDL" -- a torrent stuck there making zero byte progress
 # for 20+ minutes is exactly as dead as one stuck in an active-looking state,
 # it just never shows up if this only watches the active-looking ones.
@@ -304,7 +306,7 @@ def clean_dead_torrents():
     """A torrent used to be flagged dead from a single instantaneous
     snapshot (0 seeds AND 0 dlspeed at the exact moment of one 30-min
     check) -- but a torrent can show a brief nonzero seed/speed blip
-    without ever making real progress, which let 'Teen Titans S01E04' sit
+    without ever making real progress, which let one real TV episode sit
     stalled 15+ hours across many checks completely undetected. Tracked
     now by actual bytes downloaded across two consecutive runs instead: a
     torrent in an active-but-not-progressing state that has downloaded
@@ -561,9 +563,10 @@ def clean_malicious_executables():
     """Detects releases where the entire downloaded item is a single executable
     file rather than a real video (outputPath itself ends in an executable
     extension) -- a disguised-malware pattern, not a legitimate release
-    regardless of file size. Hit with 'Silo S03E02 ... .exe' (1.2GB, a
-    plausible size for a real episode, but TV/movie releases are never
-    shipped as a bare .exe -- always a direct .mkv/.mp4 or a folder of them).
+    regardless of file size. Hit live with a TV episode padded out to a bare
+    .exe (1.2GB, a plausible size for a real episode, but TV/movie releases
+    are never shipped as a bare .exe -- always a direct .mkv/.mp4 or a folder
+    of them).
     Deletes the file from disk directly via qBittorrent (deleteFiles=true,
     not just dequeues it), blocklists the release, and triggers a fresh
     search. Deliberately narrow: only fires when outputPath itself is the
@@ -640,8 +643,8 @@ def clean_redundant_downloads():
     leftover duplicate grab from an earlier batch search. clean_dead_torrents
     never catches these since they aren't dead, they're just pointless; left
     alone they'd occupy a download slot for their entire runtime doing
-    nothing useful (hit live with 'My Roommate Is a Cat' and 'The Royal
-    Tutor' both fully complete but still churning a duplicate download).
+    nothing useful (hit live with two different completed shows both fully
+    complete but still churning a duplicate download).
     skipRedownload=true throughout via delete_bulk, and deliberately no
     trigger_search call afterward -- the content is already satisfied, so a
     fresh search would be wrong, not just unnecessary."""
@@ -715,7 +718,7 @@ def check_disk_space():
     host while the real files live inside the LXC -- asking qBittorrent
     sidesteps that filesystem-boundary mismatch entirely. Only warns; never
     attempts to free space itself, since deciding what's safe to delete
-    needs human judgment."""
+    needs human judgement."""
     try:
         cookie = qbit_login()
         data = qbit_get("/api/v2/sync/maindata", cookie)
@@ -741,7 +744,7 @@ MALICIOUS_TITLE_PATTERN = re.compile(r"SECURITY -- deleted disguised-executable 
 # blocklists a genuinely-dead release, this check un-blocklists it minutes
 # later because the episode is still missing, Sonarr re-grabs the exact same
 # still-dead release, the watchdog blocklists it again -- a real infinite
-# loop caught live with Link Click S01E07-10, cycling grab/fail every 20-30
+# loop caught live with a multi-episode batch, cycling grab/fail every 20-30
 # minutes for hours. A release that recovered seeders needs real-world time
 # to do so anyway, so losing a few hours of recovery latency costs nothing.
 BLOCKLIST_RECOVERY_MIN_AGE_HOURS = 24
@@ -853,10 +856,10 @@ SEASON_EP_PATTERNS = [
 ]
 
 # Fallback for release groups that put the season only in the folder name and
-# a bare episode marker in each file (e.g. "[Reaktor] ... Stardust Crusaders
-# S02 [1080p].../... - E10 [1080p]...mkv" -- hit with JoJo's Bizarre
-# Adventure). Season and episode are combined from two different strings, so
-# this only applies when the primary same-string SEASON_EP_PATTERNS above
+# a bare episode marker in each file (e.g. "[Group] Some Anime Season Name
+# S02 [1080p].../... - E10 [1080p]...mkv" -- hit live with one long-running
+# anime series). Season and episode are combined from two different strings,
+# so this only applies when the primary same-string SEASON_EP_PATTERNS above
 # don't match.
 SEASON_FROM_FOLDER_PATTERN = re.compile(r'\bS(\d{1,2})\b')
 EPISODE_ONLY_PATTERN = re.compile(r'-\s*E(\d{1,3})\s*[\[\.]')
@@ -864,8 +867,8 @@ EPISODE_ONLY_PATTERN = re.compile(r'-\s*E(\d{1,3})\s*[\[\.]')
 # Some BDRip/DVDRip groups spell the episode marker "Ep.03" / "Ep 03" rather
 # than "E03", with season given elsewhere in the same filename as a bare
 # "S01" not immediately followed by the episode number (e.g.
-# "Akatsuki.no.Yona.S01.2014.x264.BDRip.1080p.Deadmauvlad.Ep.03.mkv" -- hit
-# with Yona of the Dawn, all 27 files stuck in manual review every run).
+# "Some.Anime.Title.S01.2014.x264.BDRip.1080p.Group.Ep.03.mkv" -- hit live
+# with one anime series, all 27 files stuck in manual review every run).
 EPISODE_MARKER_PATTERN = re.compile(r'\bEp\.?\s*(\d{1,3})\b', re.IGNORECASE)
 
 # Categories Sonarr/Radarr actively manage -- only these get scanned for
@@ -958,7 +961,7 @@ def submit_manual_import(base, key, files, import_mode="copy"):
 def clear_stale_queue_entries(base, key, target_hash):
     """After a successful manual import via explicit episode/movie ID override,
     Sonarr/Radarr don't always clear the matching queue entry on their own (hit
-    with JoJo's Bizarre Adventure S1 -- files fully imported, but the queue kept
+    live with one anime season -- files fully imported, but the queue kept
     showing it stuck 'importPending' indefinitely). Clean those up directly so
     the queue doesn't keep reporting something as stuck that's actually done.
     removeFromClient=false since the download itself is untouched -- this only
@@ -1036,7 +1039,7 @@ def rescue_stuck_imports():
                 # no matter what else about the release looks like, so trust
                 # it and skip silently instead of re-flagging the same
                 # never-resolvable file as NEEDS MANUAL REVIEW every run
-                # forever (hit with JoJo's Bizarre Adventure S02's bundled
+                # forever (hit live with one anime season's bundled
                 # NCED/NCOP clips sitting in an Extra/ folder).
                 if any((r.get("reason", "") if isinstance(r, dict) else str(r)).strip().lower() == "sample" for r in rejections):
                     continue
@@ -1121,8 +1124,8 @@ def rescue_stuck_imports():
                         break
 
                 if not match:
-                    # season can be a bare "S01" in either the folder name
-                    # (JoJo-style) or the filename itself (Yona-style); try
+                    # season can be a bare "S01" in either the folder name or
+                    # the filename itself, depending on the release group; try
                     # the filename first since it's the more specific source.
                     season_m = SEASON_FROM_FOLDER_PATTERN.search(fname) or SEASON_FROM_FOLDER_PATTERN.search(item.get("folderName", ""))
                     episode_m = EPISODE_ONLY_PATTERN.search(fname) or EPISODE_MARKER_PATTERN.search(fname)
@@ -1138,9 +1141,10 @@ def rescue_stuck_imports():
                 # Only trust "Sonarr already had it right" when its guess is a
                 # single specific episode. A guess spanning many episodes (the
                 # "single episode file contains all episodes in seasons" bug,
-                # e.g. JoJo's) trivially contains our regex match without
-                # meaning Sonarr actually identified it -- fall through and
-                # let the regex-derived target decide instead.
+                # hit live with one long-running anime series) trivially
+                # contains our regex match without meaning Sonarr actually
+                # identified it -- fall through and let the regex-derived
+                # target decide instead.
                 if match in parsed and len(parsed) == 1:
                     # Sonarr already had it right; a genuine "not an upgrade" -- leave it.
                     needs_review.append(f"{fname}: {rejections} (Sonarr's parse matches filename, real rejection)")
@@ -1158,8 +1162,8 @@ def rescue_stuck_imports():
                     # If the parsed episode number runs past the last real
                     # episode of that season, it's almost certainly an OVA /
                     # special where the release used one continuous numbering
-                    # that spills past the TV run (e.g. Yona of the Dawn: 24 TV
-                    # episodes, then Ep.25/26/27 are the OVAs, which live under
+                    # that spills past the TV run (hit live with a 24-episode
+                    # anime season where Ep.25/26/27 were OVAs living under
                     # Sonarr's unmonitored specials). Those aren't wanted, so
                     # skip silently rather than flagging manual review forever.
                     # A genuinely missing regular episode would fall within the

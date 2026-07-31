@@ -47,15 +47,16 @@ LOW_SPEED_MIN_AGE_SECONDS = 20 * 60
 STUCK_COMMAND_MIN_AGE_SECONDS = 5 * 60
 # A search command stuck on the exact same message this long isn't slow, it's
 # wedged on a hung network call to an indexer that never returned (seen live: a
-# single search stuck ~2 hours behind a transient Nyaa blip, blocking every
+# single search stuck ~2 hours behind a transient indexer blip, blocking every
 # other queued search). Sonarr's API can't cancel these, so the only real fix
 # is restarting the container -- which is safe (downloads live in qBittorrent)
 # and clears the jam.
 STUCK_COMMAND_RESTART_SECONDS = 30 * 60
-# A command can also monopolize one of Sonarr's few execution slots for a very
+# A command can also monopolise one of Sonarr's few execution slots for a very
 # long time WITHOUT ever freezing on one identical message -- seen live: a
-# JoJo SeriesSearch that kept advancing one episode at a time (so the message
-# genuinely kept changing, never tripping the freeze check above) but took
+# SeriesSearch on one long-running anime series that kept advancing one
+# episode at a time (so the message genuinely kept changing, never tripping
+# the freeze check above) but took
 # over 2 hours total, apparently hanging hard on a handful of individual
 # episodes along the way. The whole time, it starved 24 other queued commands
 # (RSS sync, import list sync, housekeeping) that never got a turn. Measured
@@ -237,7 +238,7 @@ def check_stuck_commands_for(state, now, service_name, base, key, container_name
     # Auto-remediate two distinct ways a command can wedge the queue:
     # (a) truly frozen -- identical message for STUCK_COMMAND_RESTART_SECONDS,
     #     a hung network call that will never resolve on its own.
-    # (b) monopolizing a slot for TOTAL_COMMAND_AGE_RESTART_SECONDS even while
+    # (b) monopolising a slot for TOTAL_COMMAND_AGE_RESTART_SECONDS even while
     #     technically still progressing (message keeps changing), starving
     #     everything queued behind it just as badly as a true freeze.
     # Neither service's API can cancel either case, so a container restart is
