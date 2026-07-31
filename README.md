@@ -1,6 +1,6 @@
 # arr-dashboard
 
-A self-healing automation pipeline for a home media server (Sonarr, Radarr, qBittorrent). Three stdlib-only Python programs, no pip dependencies, running unattended on cron/systemd.
+A self-healing automation pipeline for a home media server (Sonarr, Radarr, and a download client). Three stdlib-only Python programs, no pip dependencies, running unattended on cron/systemd.
 
 ## What it does
 
