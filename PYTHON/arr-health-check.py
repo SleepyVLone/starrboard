@@ -15,25 +15,28 @@
 # 2) Transfer speed bottleneck: qBittorrent reports active downloads but total
 #    speed stays near-zero across two consecutive checks (20 min) -- points to
 #    something wrong beyond any single stuck torrent (throttling, connectivity).
-# 3) Sonarr command queue freeze: a command stuck in "started" with the exact
-#    same status message across 5+ minutes is genuinely frozen, not just
-#    working through a long list -- legitimate multi-episode searches update
-#    their message every request as they move to the next episode.
+# 3) Sonarr/Radarr command queue freeze: a command stuck in "started" with the
+#    exact same status message across 5+ minutes is genuinely frozen, not just
+#    working through a long list -- legitimate multi-episode/movie searches
+#    update their message every request as they move to the next item. Watched
+#    independently for both services, so a wedge in one doesn't need the other
+#    to also be stuck before it's caught.
 
 import json
-import os
 import subprocess
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 
-SONARR = os.environ.get("SONARR_URL", "http://localhost:8989")
-SONARR_KEY = os.environ.get("SONARR_API_KEY", "")
+from arr_common import config
+from arr_common.config import SONARR_URL, SONARR_API_KEY, RADARR_URL, RADARR_API_KEY, QBIT_BASE
+from arr_common.qbittorrent import login as qbit_login
+from arr_common.qbittorrent import get as qbit_get
+from arr_common.state import load_json_state, save_json_state
 
-QBIT_BASE = os.environ.get("QBIT_URL", "http://localhost:8080")
-QBIT_USER = os.environ.get("QBIT_USER", "admin")
-QBIT_PASS = os.environ.get("QBIT_PASS", "")
+SONARR = SONARR_URL
+SONARR_KEY = SONARR_API_KEY
 
 STATE_FILE = "/tmp/arr-health-check-state.json"
 LOG_PATH = "/var/log/arr-queue-cleaner.log"
@@ -61,23 +64,18 @@ STUCK_COMMAND_RESTART_SECONDS = 30 * 60
 # above the freeze threshold so a large-but-healthy search (many missing
 # episodes, each taking real seconds) has plenty of room before this fires.
 TOTAL_COMMAND_AGE_RESTART_SECONDS = 60 * 60
-# Never restart Sonarr more than once per this window, so a command that keeps
-# wedging can't turn into a restart loop -- it gets one automatic attempt, then
-# is left logged for a human if it's somehow still stuck an hour later.
-SONARR_RESTART_COOLDOWN_SECONDS = 60 * 60
+# Never restart a service more than once per this window, so a command that
+# keeps wedging can't turn into a restart loop -- it gets one automatic
+# attempt, then is left logged for a human if it's somehow still stuck an
+# hour later. Shared by both Sonarr and Radarr, tracked separately per service.
+RESTART_COOLDOWN_SECONDS = 60 * 60
 
-
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+# (service label, base URL, API key, docker container name) for the generic
+# stuck-command watchdog below.
+ARR_INSTANCES = [
+    ("Sonarr", SONARR_URL, SONARR_API_KEY, "sonarr"),
+    ("Radarr", RADARR_URL, RADARR_API_KEY, "radarr"),
+]
 
 
 def sonarr_get(path):
@@ -104,19 +102,6 @@ def sonarr_delete_queue(queue_id):
     )
     req = urllib.request.Request(url, method="DELETE", headers={"X-Api-Key": SONARR_KEY})
     urllib.request.urlopen(req, timeout=30)
-
-
-def qbit_login():
-    data = urllib.parse.urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
-    req = urllib.request.Request(f"{QBIT_BASE}/api/v2/auth/login", data=data, method="POST")
-    resp = urllib.request.urlopen(req, timeout=30)
-    return resp.headers.get("Set-Cookie", "").split(";")[0]
-
-
-def qbit_get(path, cookie):
-    req = urllib.request.Request(f"{QBIT_BASE}{path}", headers={"Cookie": cookie})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
 
 
 def check_stalled_torrents(state, now):
@@ -197,9 +182,20 @@ def check_transfer_speed(state, now):
     return []
 
 
-def check_stuck_commands(state, now):
-    commands = sonarr_get("/api/v3/command")
-    prev = state.get("stuck_commands", {})
+def check_stuck_commands_for(state, now, service_name, base, key, container_name):
+    """Watches one Sonarr/Radarr instance's command queue for either way it can
+    wedge, and auto-restarts its container to clear the jam. State is kept
+    per-service (state[f"{container_name}_stuck_commands"], etc.) so Sonarr and
+    Radarr are tracked independently -- one wedging never masks or restarts
+    the other."""
+    req = urllib.request.Request(f"{base}/api/v3/command", headers={"X-Api-Key": key})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        commands = json.loads(r.read())
+
+    stuck_key = f"{container_name}_stuck_commands"
+    restart_key = f"{container_name}_last_restart"
+
+    prev = state.get(stuck_key, {})
     current = {}
     results = []
     now_utc = datetime.now(timezone.utc)
@@ -219,7 +215,7 @@ def check_stuck_commands(state, now):
             elapsed = now - first_seen
             if elapsed >= STUCK_COMMAND_MIN_AGE_SECONDS:
                 results.append(
-                    f"Sonarr command queue frozen: '{c.get('commandName')}' (id {cid}) "
+                    f"{service_name} command queue frozen: '{c.get('commandName')}' (id {cid}) "
                     f"unchanged for {int(elapsed / 60)}min: {message}"
                 )
         else:
@@ -236,16 +232,17 @@ def check_stuck_commands(state, now):
             except ValueError:
                 pass
 
-    state["stuck_commands"] = current
+    state[stuck_key] = current
 
-    # Auto-remediate two distinct ways a command can wedge Sonarr's queue:
+    # Auto-remediate two distinct ways a command can wedge the queue:
     # (a) truly frozen -- identical message for STUCK_COMMAND_RESTART_SECONDS,
     #     a hung network call that will never resolve on its own.
     # (b) monopolizing a slot for TOTAL_COMMAND_AGE_RESTART_SECONDS even while
     #     technically still progressing (message keeps changing), starving
     #     everything queued behind it just as badly as a true freeze.
-    # Sonarr's API can't cancel either case, so a container restart is the fix
-    # for both. Guarded by a shared cooldown so it can't turn into a restart loop.
+    # Neither service's API can cancel either case, so a container restart is
+    # the fix for both. Guarded by a per-service cooldown so it can't turn
+    # into a restart loop.
     worst_frozen = max((now - v["first_seen"] for v in current.values()), default=0)
     trigger_reason = None
     if worst_frozen >= STUCK_COMMAND_RESTART_SECONDS:
@@ -254,25 +251,35 @@ def check_stuck_commands(state, now):
         trigger_reason = f"running {int(oldest_running_seconds / 60)}min total ({oldest_running_desc}), starving the rest of the queue"
 
     if trigger_reason:
-        last_restart = state.get("last_sonarr_restart", 0)
-        if now - last_restart >= SONARR_RESTART_COOLDOWN_SECONDS:
+        last_restart = state.get(restart_key, 0)
+        if now - last_restart >= RESTART_COOLDOWN_SECONDS:
             try:
                 subprocess.run(
-                    ["/usr/sbin/pct", "exec", "100", "--", "docker", "restart", "sonarr"],
+                    ["/usr/sbin/pct", "exec", "100", "--", "docker", "restart", container_name],
                     capture_output=True, text=True, timeout=120,
                 )
-                state["last_sonarr_restart"] = now
-                state["stuck_commands"] = {}  # queue is cleared by the restart
-                results.append(f"Sonarr command queue: {trigger_reason} -> restarted Sonarr to clear it")
+                state[restart_key] = now
+                state[stuck_key] = {}  # queue is cleared by the restart
+                results.append(f"{service_name} command queue: {trigger_reason} -> restarted {service_name} to clear it")
             except Exception as e:
-                results.append(f"Sonarr command queue: {trigger_reason} -> ERROR restarting Sonarr: {e}")
+                results.append(f"{service_name} command queue: {trigger_reason} -> ERROR restarting {service_name}: {e}")
         else:
             results.append(
-                f"Sonarr command queue: {trigger_reason}, but a Sonarr restart happened "
-                f"{int((now - last_restart) / 60)}min ago (<{SONARR_RESTART_COOLDOWN_SECONDS // 60}min cooldown) "
+                f"{service_name} command queue: {trigger_reason}, but a {service_name} restart happened "
+                f"{int((now - last_restart) / 60)}min ago (<{RESTART_COOLDOWN_SECONDS // 60}min cooldown) "
                 f"-- leaving for manual review to avoid a restart loop"
             )
 
+    return results
+
+
+def check_stuck_commands(state, now):
+    results = []
+    for service_name, base, key, container_name in ARR_INSTANCES:
+        try:
+            results.extend(check_stuck_commands_for(state, now, service_name, base, key, container_name))
+        except Exception as e:
+            results.append(f"{service_name} command check: ERROR: {e}")
     return results
 
 
@@ -364,8 +371,12 @@ def check_qbit_port_sync():
 
 def main():
     now = time.time()
-    state = load_state()
+    state = load_json_state(STATE_FILE)
     results = []
+
+    missing = config.missing_required()
+    if missing:
+        results.append(f"WARNING: missing required environment variables: {', '.join(missing)} -- see .env.example")
 
     for label, fn in (
         # VPN-orphan first: if it restarts qBittorrent, the qBittorrent-dependent
@@ -375,14 +386,14 @@ def main():
         ("qBittorrent port sync check", check_qbit_port_sync),
         ("0-seed stall check", lambda: check_stalled_torrents(state, now)),
         ("Transfer speed check", lambda: check_transfer_speed(state, now)),
-        ("Sonarr command check", lambda: check_stuck_commands(state, now)),
+        ("Command queue check", lambda: check_stuck_commands(state, now)),
     ):
         try:
             results.extend(fn())
         except Exception as e:
             results.append(f"{label}: ERROR: {e}")
 
-    save_state(state)
+    save_json_state(STATE_FILE, state)
 
     if results:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

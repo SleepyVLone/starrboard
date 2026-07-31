@@ -148,22 +148,19 @@
 #     once, not every 30 minutes forever.
 
 import json
-import os
 import re
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 
-SONARR = ("Sonarr", os.environ.get("SONARR_URL", "http://localhost:8989"), os.environ.get("SONARR_API_KEY", ""))
-RADARR = ("Radarr", os.environ.get("RADARR_URL", "http://localhost:7878"), os.environ.get("RADARR_API_KEY", ""))
-INSTANCES = [SONARR, RADARR]
+from arr_common import config
+from arr_common.config import SONARR, RADARR, INSTANCES, QBIT_BASE
+from arr_common.qbittorrent import login as qbit_login
+from arr_common.qbittorrent import get as qbit_get
+from arr_common.state import load_json_state, save_json_state
 
 SELF_LOG_PATH = "/var/log/arr-queue-cleaner.log"  # this script's own cron-redirected output
-
-QBIT_BASE = os.environ.get("QBIT_URL", "http://localhost:8080")
-QBIT_USER = os.environ.get("QBIT_USER", "admin")
-QBIT_PASS = os.environ.get("QBIT_PASS", "")
 
 # A torrent must be at least this old (seconds) before it's eligible to be
 # flagged dead -- gives fresh grabs time to announce to trackers first.
@@ -284,20 +281,6 @@ def clean_bonus_only_releases(name, base, key):
     return f"{name}: bonus-only releases:\n" + "\n".join(results)
 
 
-def qbit_login():
-    data = urllib.parse.urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
-    req = urllib.request.Request(f"{QBIT_BASE}/api/v2/auth/login", data=data, method="POST")
-    resp = urllib.request.urlopen(req, timeout=30)
-    cookie = resp.headers.get("Set-Cookie", "").split(";")[0]
-    return cookie
-
-
-def qbit_get(path, cookie):
-    req = urllib.request.Request(f"{QBIT_BASE}{path}", headers={"Cookie": cookie})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
-
-
 TORRENT_STATE_PATH = "/tmp/arr-queue-cleaner-torrent-state.json"
 # Remembers which "needs manual review" items have already been reported, so a
 # genuinely unfixable file (e.g. a movie not in the library at all) is logged
@@ -307,28 +290,6 @@ REVIEW_LEDGER_PATH = "/tmp/arr-queue-cleaner-review-ledger.json"
 # eligible for import" state -- see item 9 in the module docstring.
 PHANTOM_STATE_PATH = "/tmp/arr-queue-cleaner-phantom-state.json"
 PHANTOM_MIN_AGE_SECONDS = 45 * 60
-
-
-def load_json_state(path):
-    """Any failure -- missing, empty (a prior run killed mid-write), or corrupt
-    JSON -- returns {} so a bad state file can never permanently wedge a run.
-    This whole pipeline is meant to survive unattended, so nothing here is
-    allowed to hard-fail on its own bookkeeping."""
-    try:
-        with open(path) as f:
-            content = f.read().strip()
-        return json.loads(content) if content else {}
-    except Exception:
-        return {}
-
-
-def save_json_state(path, state):
-    """Atomic write (temp file + rename) so a kill mid-write can never leave a
-    truncated/half-written file that the next run would choke on."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, path)
 
 
 def load_torrent_state():
@@ -1279,54 +1240,64 @@ def rescue_stuck_imports():
     return "Stuck imports:\n" + "\n".join(results)
 
 
-ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-print(f"{ts} === run ===")
-for name, base, key in INSTANCES:
+def main():
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} === run ===")
+
+    missing = config.missing_required()
+    if missing:
+        print(f"WARNING: missing required environment variables: {', '.join(missing)} -- see .env.example")
+
+    for name, base, key in INSTANCES:
+        try:
+            print(clean_not_an_upgrade(name, base, key))
+        except Exception as e:
+            print(f"{name}: ERROR: {e}")
+        try:
+            print(clean_bonus_only_releases(name, base, key))
+        except Exception as e:
+            print(f"{name}: ERROR (bonus-only releases): {e}")
+
     try:
-        print(clean_not_an_upgrade(name, base, key))
+        print(clean_dead_torrents())
     except Exception as e:
-        print(f"{name}: ERROR: {e}")
+        print(f"Dead torrents: ERROR: {e}")
+
     try:
-        print(clean_bonus_only_releases(name, base, key))
+        print(clean_phantom_complete_downloads())
     except Exception as e:
-        print(f"{name}: ERROR (bonus-only releases): {e}")
+        print(f"Phantom-completion check: ERROR: {e}")
 
-try:
-    print(clean_dead_torrents())
-except Exception as e:
-    print(f"Dead torrents: ERROR: {e}")
+    try:
+        print(clean_malicious_executables())
+    except Exception as e:
+        print(f"Malicious executables: ERROR: {e}")
 
-try:
-    print(clean_phantom_complete_downloads())
-except Exception as e:
-    print(f"Phantom-completion check: ERROR: {e}")
+    try:
+        print(clean_redundant_downloads())
+    except Exception as e:
+        print(f"Redundant downloads: ERROR: {e}")
 
-try:
-    print(clean_malicious_executables())
-except Exception as e:
-    print(f"Malicious executables: ERROR: {e}")
+    try:
+        print(rescue_stuck_imports())
+    except Exception as e:
+        print(f"Stuck imports: ERROR: {e}")
 
-try:
-    print(clean_redundant_downloads())
-except Exception as e:
-    print(f"Redundant downloads: ERROR: {e}")
+    try:
+        print(clean_recovered_blocklist_entries())
+    except Exception as e:
+        print(f"Blocklist review: ERROR: {e}")
 
-try:
-    print(rescue_stuck_imports())
-except Exception as e:
-    print(f"Stuck imports: ERROR: {e}")
+    try:
+        print(check_disk_space())
+    except Exception as e:
+        print(f"Disk space: ERROR: {e}")
 
-try:
-    print(clean_recovered_blocklist_entries())
-except Exception as e:
-    print(f"Blocklist review: ERROR: {e}")
+    try:
+        print(check_orphaned_additions())
+    except Exception as e:
+        print(f"Orphaned additions: ERROR: {e}")
 
-try:
-    print(check_disk_space())
-except Exception as e:
-    print(f"Disk space: ERROR: {e}")
 
-try:
-    print(check_orphaned_additions())
-except Exception as e:
-    print(f"Orphaned additions: ERROR: {e}")
+if __name__ == "__main__":
+    main()

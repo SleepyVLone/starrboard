@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>arr-queue-cleaner &mdash; calendar</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/css/calendar.css">
+</head>
+<body>
+
+<header class="topbar">
+    <a class="back-link" href="/">&larr; Overview</a>
+    <nav class="topbar-nav">
+        <a href="/">Overview</a>
+        <a href="/calendar" class="active">Calendar</a>
+        <a href="/library">Library</a>
+        <a href="/history">History</a>
+    </nav>
+    <div style="width: 90px"></div>
+</header>
+
+<div class="wrap">
+    <div class="cal-header">
+        <div class="cal-month-label" id="calMonthLabel">&nbsp;</div>
+        <div class="cal-nav">
+            <div class="cal-nav-btn" onclick="shiftMonth(-1)">&#8249;</div>
+            <div class="cal-today-btn" onclick="goToday()">Today</div>
+            <div class="cal-nav-btn" onclick="shiftMonth(1)">&#8250;</div>
+        </div>
+    </div>
+
+    <div class="cal-weekdays">
+        <div class="cal-weekday">Sun</div>
+        <div class="cal-weekday">Mon</div>
+        <div class="cal-weekday">Tue</div>
+        <div class="cal-weekday">Wed</div>
+        <div class="cal-weekday">Thu</div>
+        <div class="cal-weekday">Fri</div>
+        <div class="cal-weekday">Sat</div>
+    </div>
+    <div class="cal-grid" id="calGrid"></div>
+</div>
+
+<script src="/js/calendar.js"></script>
+</body>
+</html>

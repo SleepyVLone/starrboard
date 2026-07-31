@@ -1,0 +1,294 @@
+:root
+{
+    --ink: #1c234c;
+    --glass: rgba(28, 32, 66, 0.52);
+    --glass-border: rgba(255, 255, 255, 0.16);
+    --text: #eef0ff;
+    --dim: #b9bfe6;
+    --coral: #f2b6ae;
+    --coral-strong: #f5978b;
+    --mint: #a6e3c8;
+    --star: #fff6df;
+}
+
+*
+{
+    box-sizing: border-box;
+}
+
+html,
+body
+{
+    height: 100%;
+}
+
+body
+{
+    margin: 0;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 0 1.25rem 4rem;
+    background-image: radial-gradient(1.5px 1.5px at 12% 18%, var(--star) 50%, transparent 55%), radial-gradient(1.5px 1.5px at 24% 9%, var(--star) 50%, transparent 55%), radial-gradient(1px 1px at 33% 26%, var(--star) 50%, transparent 55%), url("/bg.png");
+    background-repeat: no-repeat;
+    background-size: auto, auto, auto, cover;
+    background-position: center;
+    background-attachment: fixed;
+}
+
+body::before
+{
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: linear-gradient(180deg, rgba(12, 15, 40, 0.35) 0%, rgba(12, 15, 40, 0.15) 40%, rgba(12, 15, 40, 0.45) 100%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.wrap
+{
+    max-width: 760px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 1;
+    padding-top: 2.5rem;
+}
+
+.topbar
+{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: relative;
+    margin: 0 -1.25rem 2rem;
+    padding: 1.5rem 2rem 1.75rem;
+}
+
+.topbar-nav
+{
+    display: flex;
+    gap: 2rem;
+    font-size: 0.95rem;
+    color: var(--dim);
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.topbar-nav a
+{
+    color: inherit;
+    text-decoration: none;
+}
+
+.topbar-nav a.active
+{
+    color: var(--text);
+    font-weight: 600;
+    border-bottom: 2px solid var(--coral);
+    padding-bottom: 0.3rem;
+}
+
+.back-link
+{
+    color: var(--star);
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.back-link:hover
+{
+    text-decoration: underline;
+}
+
+.tabs
+{
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.tab
+{
+    flex: 1;
+    text-align: center;
+    padding: 0.7rem;
+    border-radius: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    color: var(--dim);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tab.active
+{
+    color: var(--text);
+    border-color: var(--coral);
+    background: rgba(242, 182, 174, 0.12);
+}
+
+.search-row
+{
+    display: flex;
+    gap: 0.6rem;
+    margin-bottom: 1rem;
+}
+
+.search-input
+{
+    flex: 1;
+    padding: 0.8rem 1rem;
+    border-radius: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    color: var(--text);
+    font-size: 0.95rem;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.search-input::placeholder
+{
+    color: var(--dim);
+}
+
+.search-input:focus
+{
+    outline: none;
+    border-color: var(--coral);
+}
+
+.settings-row
+{
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+    padding: 0.9rem 1rem;
+    border-radius: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.settings-row label
+{
+    font-size: 0.78rem;
+    color: var(--dim);
+}
+
+.settings-row select
+{
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--glass-border);
+    color: var(--text);
+    padding: 0.4rem 0.6rem;
+    border-radius: 8px;
+    font-size: 0.85rem;
+}
+
+.result-card
+{
+    display: flex;
+    gap: 1rem;
+    padding: 1rem;
+    border-radius: 14px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    margin-bottom: 0.9rem;
+}
+
+.result-poster
+{
+    width: 64px;
+    height: 96px;
+    border-radius: 8px;
+    object-fit: cover;
+    flex: none;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.result-info
+{
+    flex: 1;
+    min-width: 0;
+}
+
+.result-title
+{
+    font-size: 0.98rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.result-year
+{
+    color: var(--dim);
+    font-weight: 400;
+}
+
+.result-overview
+{
+    font-size: 0.8rem;
+    color: var(--dim);
+    margin-top: 0.3rem;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.result-action
+{
+    flex: none;
+    display: flex;
+    align-items: center;
+}
+
+.add-btn
+{
+    padding: 0.55rem 1.1rem;
+    border-radius: 999px;
+    background: rgba(166, 227, 200, 0.16);
+    border: 1px solid rgba(166, 227, 200, 0.5);
+    color: var(--mint);
+    font-weight: 600;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.add-btn:hover
+{
+    background: rgba(166, 227, 200, 0.26);
+}
+
+.add-btn:disabled
+{
+    opacity: 0.6;
+    cursor: default;
+}
+
+.add-btn.added
+{
+    color: var(--dim);
+    border-color: var(--glass-border);
+    background: transparent;
+}
+
+.add-btn.failed
+{
+    color: var(--coral-strong);
+    border-color: rgba(245, 151, 139, 0.5);
+    background: rgba(245, 151, 139, 0.12);
+}
+
+.empty
+{
+    color: var(--dim);
+    text-align: center;
+    padding: 2.5rem;
+}
