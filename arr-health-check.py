@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# 10-minute health check, complementary to arr-queue-cleaner.py's 30-minute
+# cleanup pass. Silent when nothing is wrong -- only writes a log entry (which
+# then shows up in the existing dashboard History page, since it shares
+# arr-queue-cleaner.log's exact "=== run ===" header format) when something
+# actually needs attention.
+#
+# 1) qBittorrent 0-seed stall: a tv-sonarr torrent sitting in metaDL/stalledDL
+#    with 0 seeds for 20+ minutes (state persisted by hash, first-seen
+#    timestamp) is dead weight -- blocklist the matching Sonarr queue entry
+#    and fire a fresh episode/series search. This is a faster, seed-count-
+#    based companion to arr-queue-cleaner's 30-minute byte-progress dead-
+#    torrent check; seed count can hit zero and stay there well before a
+#    30-minute cycle would catch it.
+# 2) Transfer speed bottleneck: qBittorrent reports active downloads but total
+#    speed stays near-zero across two consecutive checks (20 min) -- points to
+#    something wrong beyond any single stuck torrent (throttling, connectivity).
+# 3) Sonarr command queue freeze: a command stuck in "started" with the exact
+#    same status message across 5+ minutes is genuinely frozen, not just
+#    working through a long list -- legitimate multi-episode searches update
+#    their message every request as they move to the next episode.
+
+import json
+import os
+import subprocess
+import time
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+
+SONARR = os.environ.get("SONARR_URL", "http://localhost:8989")
+SONARR_KEY = os.environ.get("SONARR_API_KEY", "")
+
+QBIT_BASE = os.environ.get("QBIT_URL", "http://localhost:8080")
+QBIT_USER = os.environ.get("QBIT_USER", "admin")
+QBIT_PASS = os.environ.get("QBIT_PASS", "")
+
+STATE_FILE = "/tmp/arr-health-check-state.json"
+LOG_PATH = "/var/log/arr-queue-cleaner.log"
+
+STALL_MIN_AGE_SECONDS = 20 * 60
+LOW_SPEED_THRESHOLD_BYTES = 50 * 1024  # 50 KB/s
+LOW_SPEED_MIN_AGE_SECONDS = 20 * 60
+STUCK_COMMAND_MIN_AGE_SECONDS = 5 * 60
+# A search command stuck on the exact same message this long isn't slow, it's
+# wedged on a hung network call to an indexer that never returned (seen live: a
+# single search stuck ~2 hours behind a transient Nyaa blip, blocking every
+# other queued search). Sonarr's API can't cancel these, so the only real fix
+# is restarting the container -- which is safe (downloads live in qBittorrent)
+# and clears the jam.
+STUCK_COMMAND_RESTART_SECONDS = 30 * 60
+# A command can also monopolize one of Sonarr's few execution slots for a very
+# long time WITHOUT ever freezing on one identical message -- seen live: a
+# JoJo SeriesSearch that kept advancing one episode at a time (so the message
+# genuinely kept changing, never tripping the freeze check above) but took
+# over 2 hours total, apparently hanging hard on a handful of individual
+# episodes along the way. The whole time, it starved 24 other queued commands
+# (RSS sync, import list sync, housekeeping) that never got a turn. Measured
+# independently via Sonarr's own started timestamp, not our own tracking, so
+# it catches this even though the message never repeats identically. Set well
+# above the freeze threshold so a large-but-healthy search (many missing
+# episodes, each taking real seconds) has plenty of room before this fires.
+TOTAL_COMMAND_AGE_RESTART_SECONDS = 60 * 60
+# Never restart Sonarr more than once per this window, so a command that keeps
+# wedging can't turn into a restart loop -- it gets one automatic attempt, then
+# is left logged for a human if it's somehow still stuck an hour later.
+SONARR_RESTART_COOLDOWN_SECONDS = 60 * 60
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def sonarr_get(path):
+    req = urllib.request.Request(f"{SONARR}{path}", headers={"X-Api-Key": SONARR_KEY})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def sonarr_post(path, body):
+    req = urllib.request.Request(
+        f"{SONARR}{path}",
+        data=json.dumps(body).encode(),
+        headers={"X-Api-Key": SONARR_KEY, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def sonarr_delete_queue(queue_id):
+    url = (
+        f"{SONARR}/api/v3/queue/{queue_id}?removeFromClient=true"
+        f"&blocklist=true&skipRedownload=true"
+    )
+    req = urllib.request.Request(url, method="DELETE", headers={"X-Api-Key": SONARR_KEY})
+    urllib.request.urlopen(req, timeout=30)
+
+
+def qbit_login():
+    data = urllib.parse.urlencode({"username": QBIT_USER, "password": QBIT_PASS}).encode()
+    req = urllib.request.Request(f"{QBIT_BASE}/api/v2/auth/login", data=data, method="POST")
+    resp = urllib.request.urlopen(req, timeout=30)
+    return resp.headers.get("Set-Cookie", "").split(";")[0]
+
+
+def qbit_get(path, cookie):
+    req = urllib.request.Request(f"{QBIT_BASE}{path}", headers={"Cookie": cookie})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def check_stalled_torrents(state, now):
+    cookie = qbit_login()
+    torrents = qbit_get("/api/v2/torrents/info", cookie)
+    queue = sonarr_get("/api/v3/queue?pageSize=1000").get("records", [])
+    queue_by_hash = {r["downloadId"].lower(): r for r in queue if r.get("downloadId")}
+
+    prev = state.get("stalled_torrents", {})
+    current = {}
+    results = []
+
+    for t in torrents:
+        if t.get("category") != "tv-sonarr":
+            continue
+        # "stoppedDL" included alongside the active-looking states: found live
+        # that genuinely dead (0 seeders confirmed by the tracker itself, not
+        # just our own view) torrents can sit stopped rather than actively
+        # retrying, and would otherwise never be caught by this check at all.
+        if t.get("state") not in ("metaDL", "stalledDL", "stoppedDL"):
+            continue
+        if t.get("num_seeds", 0) != 0:
+            continue
+
+        h = t["hash"].lower()
+        first_seen = prev.get(h, {}).get("first_seen", now)
+        elapsed = now - first_seen
+
+        if elapsed < STALL_MIN_AGE_SECONDS:
+            current[h] = {"first_seen": first_seen, "name": t["name"]}
+            continue
+
+        qrec = queue_by_hash.get(h)
+        if qrec is None:
+            current[h] = {"first_seen": first_seen, "name": t["name"]}
+            results.append(f"0-seed stall (no matching Sonarr queue entry, left alone): {t['name'][:70]}")
+            continue
+
+        try:
+            sonarr_delete_queue(qrec["id"])
+            episode_id = qrec.get("episodeId")
+            if episode_id:
+                sonarr_post("/api/v3/command", {"name": "EpisodeSearch", "episodeIds": [episode_id]})
+            else:
+                sonarr_post("/api/v3/command", {"name": "SeriesSearch", "seriesId": qrec["seriesId"]})
+            results.append(f"0-seed stall {int(elapsed / 60)}min -> blocklisted + re-searched: {t['name'][:70]}")
+            # resolved -- don't carry forward, entry is gone from qBit/queue now
+        except Exception as e:
+            current[h] = {"first_seen": first_seen, "name": t["name"]}
+            results.append(f"0-seed stall {int(elapsed / 60)}min -> ERROR blocklisting: {e}: {t['name'][:70]}")
+
+    state["stalled_torrents"] = current
+    return results
+
+
+def check_transfer_speed(state, now):
+    cookie = qbit_login()
+    info = qbit_get("/api/v2/transfer/info", cookie)
+    torrents = qbit_get("/api/v2/torrents/info", cookie)
+    active = sum(1 for t in torrents if t.get("state") == "downloading")
+    speed = info.get("dl_info_speed", 0)
+
+    if active == 0 or speed >= LOW_SPEED_THRESHOLD_BYTES:
+        state["low_speed_since"] = None
+        return []
+
+    since = state.get("low_speed_since")
+    if since is None:
+        state["low_speed_since"] = now
+        return []
+
+    elapsed = now - since
+    if elapsed >= LOW_SPEED_MIN_AGE_SECONDS:
+        return [
+            f"Transfer speed bottleneck: {active} active downloads but only "
+            f"{speed / 1024:.1f} KB/s total, for {int(elapsed / 60)}min"
+        ]
+    return []
+
+
+def check_stuck_commands(state, now):
+    commands = sonarr_get("/api/v3/command")
+    prev = state.get("stuck_commands", {})
+    current = {}
+    results = []
+    now_utc = datetime.now(timezone.utc)
+    oldest_running_seconds = 0
+    oldest_running_desc = ""
+
+    for c in commands:
+        if c.get("status") != "started":
+            continue
+        cid = str(c["id"])
+        message = c.get("message", "")
+        prev_entry = prev.get(cid)
+
+        if prev_entry and prev_entry.get("message") == message:
+            first_seen = prev_entry["first_seen"]
+            current[cid] = {"message": message, "first_seen": first_seen}
+            elapsed = now - first_seen
+            if elapsed >= STUCK_COMMAND_MIN_AGE_SECONDS:
+                results.append(
+                    f"Sonarr command queue frozen: '{c.get('commandName')}' (id {cid}) "
+                    f"unchanged for {int(elapsed / 60)}min: {message}"
+                )
+        else:
+            current[cid] = {"message": message, "first_seen": now}
+
+        started_on = c.get("started") or c.get("queued")
+        if started_on:
+            try:
+                started_dt = datetime.fromisoformat(started_on.replace("Z", "+00:00"))
+                age = (now_utc - started_dt).total_seconds()
+                if age > oldest_running_seconds:
+                    oldest_running_seconds = age
+                    oldest_running_desc = f"'{c.get('commandName')}': {message}"
+            except ValueError:
+                pass
+
+    state["stuck_commands"] = current
+
+    # Auto-remediate two distinct ways a command can wedge Sonarr's queue:
+    # (a) truly frozen -- identical message for STUCK_COMMAND_RESTART_SECONDS,
+    #     a hung network call that will never resolve on its own.
+    # (b) monopolizing a slot for TOTAL_COMMAND_AGE_RESTART_SECONDS even while
+    #     technically still progressing (message keeps changing), starving
+    #     everything queued behind it just as badly as a true freeze.
+    # Sonarr's API can't cancel either case, so a container restart is the fix
+    # for both. Guarded by a shared cooldown so it can't turn into a restart loop.
+    worst_frozen = max((now - v["first_seen"] for v in current.values()), default=0)
+    trigger_reason = None
+    if worst_frozen >= STUCK_COMMAND_RESTART_SECONDS:
+        trigger_reason = f"frozen on one message for {int(worst_frozen / 60)}min"
+    elif oldest_running_seconds >= TOTAL_COMMAND_AGE_RESTART_SECONDS:
+        trigger_reason = f"running {int(oldest_running_seconds / 60)}min total ({oldest_running_desc}), starving the rest of the queue"
+
+    if trigger_reason:
+        last_restart = state.get("last_sonarr_restart", 0)
+        if now - last_restart >= SONARR_RESTART_COOLDOWN_SECONDS:
+            try:
+                subprocess.run(
+                    ["/usr/sbin/pct", "exec", "100", "--", "docker", "restart", "sonarr"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                state["last_sonarr_restart"] = now
+                state["stuck_commands"] = {}  # queue is cleared by the restart
+                results.append(f"Sonarr command queue: {trigger_reason} -> restarted Sonarr to clear it")
+            except Exception as e:
+                results.append(f"Sonarr command queue: {trigger_reason} -> ERROR restarting Sonarr: {e}")
+        else:
+            results.append(
+                f"Sonarr command queue: {trigger_reason}, but a Sonarr restart happened "
+                f"{int((now - last_restart) / 60)}min ago (<{SONARR_RESTART_COOLDOWN_SECONDS // 60}min cooldown) "
+                f"-- leaving for manual review to avoid a restart loop"
+            )
+
+    return results
+
+
+def _container_started_at(container):
+    """UTC start time of a docker container in LXC 100, to second resolution.
+    Docker reports RFC3339Nano (e.g. 2026-07-07T12:47:00.123681833Z); the first
+    19 chars are YYYY-MM-DDTHH:MM:SS, which is all we need and sidesteps the
+    variable fractional-digit parsing that would break a naive string compare."""
+    out = subprocess.run(
+        ["/usr/sbin/pct", "exec", "100", "--", "docker", "inspect",
+         "-f", "{{.State.StartedAt}}", container],
+        capture_output=True, text=True, timeout=60,
+    )
+    raw = out.stdout.strip()
+    return datetime.strptime(raw[:19], "%Y-%m-%dT%H:%M:%S") if len(raw) >= 19 else None
+
+
+def check_vpn_orphan():
+    """qBittorrent shares the gluetun VPN container's network namespace
+    (network_mode: service:gluetun). If gluetun restarts on its own -- VPN
+    re-init, image update, crash -- qBittorrent keeps running but is stranded
+    in the old, now-dead namespace: it looks "up" yet has no working network
+    and its WebUI/port stop responding, so downloads silently stall until
+    someone runs `docker restart qbittorrent` by hand. Detect that exact case
+    (gluetun started strictly later than qBittorrent) and restart qBittorrent
+    so it rejoins the live tunnel. Fires at most once per gluetun restart
+    (qBittorrent's start time then becomes the newer one) and never during a
+    normal boot, where qBittorrent already starts after gluetun. This is the
+    one failure mode in the whole stack that wouldn't otherwise self-recover."""
+    g = _container_started_at("gluetun")
+    q = _container_started_at("qbittorrent")
+    if g and q and g > q:
+        subprocess.run(
+            ["/usr/sbin/pct", "exec", "100", "--", "docker", "restart", "qbittorrent"],
+            capture_output=True, text=True, timeout=120,
+        )
+        return [
+            f"VPN orphan: gluetun restarted at {g} after qBittorrent at {q} "
+            f"-> restarted qBittorrent so it rejoins the VPN tunnel"
+        ]
+    return []
+
+
+def check_qbit_port_sync():
+    """qBittorrent shares gluetun's network stack, and ProtonVPN periodically
+    rotates gluetun's forwarded port on its own (observed 3 times in 3 days:
+    56120 -> 39510 -> 41827, no container restart involved each time).
+    Nothing keeps qBittorrent's own listen_port in sync with that automatically,
+    so it silently drifts and qBittorrent becomes unreachable for incoming
+    peer connections -- it can still connect outbound, but for anything less
+    than heavily-seeded, that's the difference between finding peers and not.
+    The visible symptom was several unrelated torrents (different shows,
+    different indexers) all sitting at 0 peers in metaDL simultaneously --
+    a network-reachability signature, not a content-availability one.
+    Reads gluetun's own forwarded_port file directly (the source of truth)
+    and pushes it into qBittorrent's WebUI preferences whenever they diverge."""
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/pct", "exec", "100", "--", "docker", "exec", "gluetun",
+             "cat", "/tmp/gluetun/forwarded_port"],
+            capture_output=True, text=True, timeout=30,
+        )
+        forwarded = int(result.stdout.strip())
+    except Exception as e:
+        return [f"qBittorrent port sync: ERROR reading gluetun forwarded port: {e}"]
+
+    cookie = qbit_login()
+    prefs = qbit_get("/api/v2/app/preferences", cookie)
+    current = prefs.get("listen_port")
+
+    if current == forwarded:
+        return []
+
+    try:
+        body = urllib.parse.urlencode(
+            {"json": json.dumps({"listen_port": forwarded, "random_port": False, "upnp": False})}
+        ).encode()
+        req = urllib.request.Request(
+            f"{QBIT_BASE}/api/v2/app/setPreferences", data=body, method="POST", headers={"Cookie": cookie},
+        )
+        urllib.request.urlopen(req, timeout=30)
+        return [
+            f"qBittorrent port sync: listen_port was {current}, VPN now forwards {forwarded} "
+            f"-> corrected (was unreachable for incoming peer connections)"
+        ]
+    except Exception as e:
+        return [f"qBittorrent port sync: listen_port {current} != VPN forwarded {forwarded} -> ERROR correcting: {e}"]
+
+
+def main():
+    now = time.time()
+    state = load_state()
+    results = []
+
+    for label, fn in (
+        # VPN-orphan first: if it restarts qBittorrent, the qBittorrent-dependent
+        # checks below simply error out for this one run (caught + logged) and
+        # are healthy again next run -- better than reading a stranded qBittorrent.
+        ("VPN orphan check", check_vpn_orphan),
+        ("qBittorrent port sync check", check_qbit_port_sync),
+        ("0-seed stall check", lambda: check_stalled_torrents(state, now)),
+        ("Transfer speed check", lambda: check_transfer_speed(state, now)),
+        ("Sonarr command check", lambda: check_stuck_commands(state, now)),
+    ):
+        try:
+            results.extend(fn())
+        except Exception as e:
+            results.append(f"{label}: ERROR: {e}")
+
+    save_state(state)
+
+    if results:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} === run ===\n")
+            for line in results:
+                f.write(line + "\n")
+
+
+if __name__ == "__main__":
+    main()
