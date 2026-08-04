@@ -14,6 +14,21 @@ QBIT_BASE = os.environ.get("QBIT_URL", "http://localhost:8080")
 QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASS = os.environ.get("QBIT_PASS", "")
 
+JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://localhost:8096")
+JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
+
+PROWLARR_URL = os.environ.get("PROWLARR_URL", "http://localhost:9696")
+PROWLARR_API_KEY = os.environ.get("PROWLARR_API_KEY", "")
+PROWLARR = ("Prowlarr", PROWLARR_URL, PROWLARR_API_KEY)
+
+# YouTube isn't Sonarr/Radarr-managed at all -- there's no indexer or release
+# to grab, so this is a separate yt-dlp pipeline. YOUTUBE_ROOT is the path as
+# seen from wherever this script actually runs; Jellyfin's own library path
+# only needs to agree with it, not be identical (they can be different mounts
+# of the same underlying storage).
+YOUTUBE_ROOT = os.environ.get("YOUTUBE_ROOT", "/media/youtube")
+YT_DLP_BIN = os.environ.get("YT_DLP_BIN", "yt-dlp")
+
 
 def missing_required():
     """Names of required environment variables still left at their empty
@@ -27,4 +42,8 @@ def missing_required():
         missing.append("RADARR_API_KEY")
     if not QBIT_PASS:
         missing.append("QBIT_PASS")
+    if not JELLYFIN_API_KEY:
+        missing.append("JELLYFIN_API_KEY")
+    if not PROWLARR_API_KEY:
+        missing.append("PROWLARR_API_KEY")
     return missing

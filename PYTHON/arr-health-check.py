@@ -23,6 +23,7 @@
 #    to also be stuck before it's caught.
 
 import json
+import re
 import subprocess
 import time
 import urllib.request
@@ -77,6 +78,8 @@ ARR_INSTANCES = [
     ("Sonarr", SONARR_URL, SONARR_API_KEY, "sonarr"),
     ("Radarr", RADARR_URL, RADARR_API_KEY, "radarr"),
 ]
+
+APPS = (("Sonarr", SONARR_URL, SONARR_API_KEY), ("Radarr", RADARR_URL, RADARR_API_KEY))
 
 
 def sonarr_get(path):
@@ -370,6 +373,90 @@ def check_qbit_port_sync():
         return [f"qBittorrent port sync: listen_port {current} != VPN forwarded {forwarded} -> ERROR correcting: {e}"]
 
 
+def app_get(base, key, path):
+    req = urllib.request.Request(f"{base}{path}", headers={"X-Api-Key": key})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def app_post(base, key, path, body):
+    req = urllib.request.Request(
+        f"{base}{path}", data=json.dumps(body).encode(),
+        headers={"X-Api-Key": key, "Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+def check_app_health(state):
+    """Sonarr/Radarr's own built-in health page (IndexerStatusCheck etc.) is
+    exactly the kind of thing a non-technical family member would never think
+    to look at, let alone know what to do about -- added live 2026-08-02
+    after Knaben (accessed through Prowlarr's proxy) briefly returned
+    Cloudflare 522s during a burst of searches. That correctly flagged
+    'Indexers unavailable due to failures: Knaben' in Radarr, but the flag
+    doesn't clear itself the moment the indexer recovers -- it sits there for
+    Radarr's own internal backoff window (can be a couple of hours) looking
+    exactly as broken as a real, permanent problem would, with no visible
+    difference between "will fix itself" and "needs a person."
+
+    Live-tests the named indexer through the app's own /indexer/test right
+    now. If it's actually fine again, fires CheckHealth + RssSync so the
+    warning has the best chance of clearing immediately instead of sitting
+    stale for its full backoff window. If it's still genuinely down, leaves
+    it alone and logs it plainly -- a real external tracker outage isn't
+    something to paper over or retry aggressively.
+
+    (Sonarr/Radarr's UpdateCheck warning is handled separately, in
+    arr-queue-cleaner.py's check_app_updates() -- applying an update means
+    pulling a new image and a container recreate, a heavier action that
+    belongs on the 30-minute maintenance cadence, not this 10-minute one.)"""
+    results = []
+
+    for name, base, key in APPS:
+        try:
+            health = app_get(base, key, "/api/v3/health")
+        except Exception as e:
+            results.append(f"{name} health check: ERROR: {e}")
+            continue
+
+        for item in health:
+            if item.get("source") != "IndexerStatusCheck":
+                continue
+            message = item.get("message", "")
+            m = re.search(r":\s*(.+)$", message)
+            indexer_name = m.group(1).strip() if m else message
+            healthy_now = False
+            try:
+                indexers = app_get(base, key, "/api/v3/indexer")
+                for idx in indexers:
+                    if idx.get("name") == indexer_name:
+                        test_result = app_post(base, key, "/api/v3/indexer/test", idx)
+                        healthy_now = not test_result
+                        break
+            except Exception:
+                healthy_now = False
+
+            if healthy_now:
+                try:
+                    app_post(base, key, "/api/v3/command", {"name": "CheckHealth"})
+                    app_post(base, key, "/api/v3/command", {"name": "RssSync"})
+                    results.append(
+                        f"{name} health: '{indexer_name}' was flagged unavailable but tests healthy again "
+                        f"right now -> triggered a health/RSS refresh so the warning clears itself"
+                    )
+                except Exception as e:
+                    results.append(f"{name} health: '{indexer_name}' recovered but ERROR triggering refresh: {e}")
+            else:
+                results.append(
+                    f"{name} health: {message} (still down when tested just now -- external tracker "
+                    f"outage, not a config issue; will clear on its own once the tracker recovers)"
+                )
+
+    return results
+
+
 def main():
     now = time.time()
     state = load_json_state(STATE_FILE)
@@ -388,6 +475,7 @@ def main():
         ("0-seed stall check", lambda: check_stalled_torrents(state, now)),
         ("Transfer speed check", lambda: check_transfer_speed(state, now)),
         ("Command queue check", lambda: check_stuck_commands(state, now)),
+        ("App health check", lambda: check_app_health(state)),
     ):
         try:
             results.extend(fn())

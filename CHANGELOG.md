@@ -10,6 +10,34 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.1.0
+
+**Added: a YouTube tab on the Add page, with its own download pipeline.**
+
+Sonarr/Radarr have no concept of YouTube as a source -- there's no indexer or release to grab -- so this is a separate `yt-dlp`-based pipeline living alongside the existing Sonarr/Radarr add flow. Give it a title, a channel/playlist/video URL, and a resolution, and it downloads into its own `Season 01` folder structure, grabs each video's real thumbnail as the episode image (and the first one as the show's poster, only the first time, so it never overwrites a poster picked by hand later), and folds its progress into the same "Now downloading" card the Sonarr/Radarr queue already uses.
+
+Jellyfin auto-identifies new items against IMDb/TMDb regardless of a library's own internet-provider settings -- confirmed live, even a real, correctly-matched library item came back with full provider IDs despite that setting being off -- so an invented YouTube title reliably gets fuzzy-matched to some unrelated real show or movie. Rather than trust that setting, the pipeline waits for Jellyfin to scan the new download in, then strips and hard-locks (`LockData`) whatever it auto-matched back to the plain local title, so no future rescan can silently rename it again either.
+
+**Added: a paced, direct-search rescue for Sonarr's Wanted backlog.**
+
+Neither Sonarr nor Radarr has a built-in recurring "search everything that's missing" task -- both only really catch new releases via RSS Sync as they're freshly posted, so anything RSS missed just sits in Wanted forever. Sonarr's own built-in bulk search command turned out unreliable at real backlog scale (firing hundreds of rapid-fire searches in minutes tripped indexer rate-limiting and silently swallowed most of the results), so this instead checks Sonarr's own per-episode release candidates directly, one at a time with a deliberate pause between each, and grabs the best clean match it finds -- capped per run so a large backlog drains over several days instead of hammering every indexer in one burst.
+
+**Added: a smarter "why is this orphaned" diagnosis.**
+
+When a monitored movie has zero grabs ever, the existing orphan check now also asks *why*: genuinely zero availability anywhere, releases existing but all wrongly rejected (naming the actual rejection reason), or a clean release existing that should already have been grabbed. That last case caught a real bug: a shared language-restriction setting was permanently rejecting perfectly good multi-audio releases because of naive filename-based language detection, for movies that had sat "unavailable" for weeks.
+
+**Added: `check_app_health()` (indexer-outage auto-recovery) to `arr-health-check.py`.**
+
+Sonarr/Radarr's own health page can flag an indexer as unavailable after a transient outage, and that flag doesn't clear itself the moment the indexer recovers -- it sits looking exactly as broken as a real, permanent problem for the app's own internal backoff window (can be hours). This live-tests the flagged indexer right now, and if it's actually fine again, triggers a health/RSS refresh so the warning clears immediately instead of sitting stale.
+
+**Added: `check_app_updates()` (auto-apply Sonarr/Radarr updates) to `arr-queue-cleaner.py`.**
+
+Backs up the app's config, pulls the new image, recreates the container, then polls until it actually responds healthy before declaring success -- one attempt per exact version string, ever, so a failed/incompatible update gets logged loudly for a person rather than retried every 30 minutes.
+
+**Fixed: the YouTube tab could report success before the Jellyfin metadata correction had actually finished.**
+
+The download-progress status only ever reached a terminal "done" state the moment the download itself completed, showing a hardcoded success message regardless of whether the metadata-correction step afterward had concluded, was still running, or had failed. It now keeps polling until that step has genuinely concluded and shows its real outcome.
+
 ## v1.0.1
 
 **Fixed: code comments referenced real, specific show titles and an indexer by name.**

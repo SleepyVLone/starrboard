@@ -292,3 +292,10 @@ body::before
     text-align: center;
     padding: 2.5rem;
 }
+
+.yt-status
+{
+    color: var(--dim);
+    font-size: 0.85rem;
+    padding: 0.3rem 0.2rem 1rem;
+}

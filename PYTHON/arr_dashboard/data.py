@@ -1,9 +1,13 @@
 import json
 import os
 import re
+import shutil
+import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from arr_common import config
@@ -24,6 +28,18 @@ STALLED_STATES = {"metaDL", "stalledDL", "downloading"}
 STALLED_MIN_AGE_SECONDS = 20 * 60
 
 RUN_HEADER_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) === run ===$')
+
+JELLYFIN_BASE = config.JELLYFIN_URL
+JELLYFIN_KEY = config.JELLYFIN_API_KEY
+YOUTUBE_ROOT = config.YOUTUBE_ROOT
+YT_DLP_BIN = config.YT_DLP_BIN
+YOUTUBE_RESOLUTIONS = {
+    "1080p": "bv*[height<=1080]+ba/b[height<=1080]",
+    "720p": "bv*[height<=720]+ba/b[height<=720]",
+    "best": "bv*+ba/b",
+}
+YOUTUBE_JOBS = {}
+YOUTUBE_JOBS_LOCK = threading.Lock()
 
 
 def get_active_downloads():
@@ -80,6 +96,23 @@ def get_active_downloads():
                 "source": name,
                 "image": image,
             })
+
+    # yt-dlp downloads never touch qBittorrent/Sonarr/Radarr, so they need
+    # folding in here separately from this same in-memory job dict.
+    with YOUTUBE_JOBS_LOCK:
+        jobs_snapshot = list(YOUTUBE_JOBS.values())
+    for job in jobs_snapshot:
+        if job["status"] not in ("starting", "downloading"):
+            continue
+        m = re.search(r'(\d{1,3}(?:\.\d)?)%', job.get("detail") or "")
+        progress = float(m.group(1)) if m else 0
+        items.append({
+            "title": job["title"],
+            "subtitle": "YouTube",
+            "progress": progress,
+            "source": "YouTube",
+            "image": None,
+        })
 
     items.sort(key=lambda i: -i["progress"])
     return items
@@ -649,3 +682,200 @@ def summarize_run(run):
     action_markers = ("DEAD:", "SECURITY", "removed", "imported", "NEEDS MANUAL REVIEW", "ERROR")
     had_action = any(marker in text for marker in action_markers)
     return had_action
+
+
+def safe_folder_name(title):
+    """Collapse a free-typed title into something safe to use as a folder
+    name -- strips path separators and other characters that would either
+    break out of youtube/ or just look wrong on disk."""
+    cleaned = re.sub(r'[\\/:*?"<>|]', "", title or "").strip()
+    cleaned = re.sub(r'\s+', " ", cleaned)
+    return cleaned[:100] or "Untitled"
+
+
+def start_youtube_download(title, url, resolution):
+    """Kicks off a background yt-dlp download into its own show/Season 01
+    folder and returns a job id the Add page can poll for progress. Runs in
+    a thread rather than blocking the request -- a channel backlog can take
+    a long time, and the dashboard's single-threaded-per-request HTTP server
+    still needs to serve other pages while it runs."""
+    if not re.match(r'^https?://(www\.)?(youtube\.com|youtu\.be)/', url or ""):
+        raise ValueError("URL must be a youtube.com or youtu.be link")
+
+    fmt = YOUTUBE_RESOLUTIONS.get(resolution, YOUTUBE_RESOLUTIONS["1080p"])
+    safe_title = safe_folder_name(title)
+
+    job_id = uuid.uuid4().hex[:12]
+    with YOUTUBE_JOBS_LOCK:
+        YOUTUBE_JOBS[job_id] = {
+            "title": safe_title,
+            "status": "starting",
+            "detail": "",
+            "started": datetime.now().isoformat(),
+        }
+
+    thread = threading.Thread(target=_run_youtube_download, args=(job_id, safe_title, url, fmt), daemon=True)
+    thread.start()
+    return job_id
+
+
+def _run_youtube_download(job_id, safe_title, url, fmt):
+    show_dir = os.path.join(YOUTUBE_ROOT, safe_title)
+    season_dir = os.path.join(show_dir, "Season 01")
+    os.makedirs(season_dir, exist_ok=True)
+
+    # playlist_index numbers episodes for a channel/playlist URL; autonumber
+    # is the fallback for a single-video URL where playlist_index is unset.
+    out_template = os.path.join(season_dir, "S01E%(playlist_index,autonumber)03d - %(title).150B [%(id)s].%(ext)s")
+    # per-show archive file so re-submitting the same channel URL later (to
+    # pick up new uploads) skips everything already downloaded.
+    archive_path = os.path.join(show_dir, ".download-archive.txt")
+
+    cmd = [
+        YT_DLP_BIN,
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "--download-archive", archive_path,
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "-o", out_template,
+        url,
+    ]
+
+    with YOUTUBE_JOBS_LOCK:
+        YOUTUBE_JOBS[job_id]["status"] = "downloading"
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                with YOUTUBE_JOBS_LOCK:
+                    YOUTUBE_JOBS[job_id]["detail"] = line
+        proc.wait()
+        ok = proc.returncode == 0
+        with YOUTUBE_JOBS_LOCK:
+            YOUTUBE_JOBS[job_id]["status"] = "done" if ok else "error"
+        if not ok:
+            return
+    except Exception as e:
+        with YOUTUBE_JOBS_LOCK:
+            YOUTUBE_JOBS[job_id]["status"] = "error"
+            YOUTUBE_JOBS[job_id]["detail"] = str(e)
+        return
+
+    # yt-dlp writes a per-video .jpg alongside each .mp4 (matching basename),
+    # which Jellyfin already picks up as that episode's thumbnail on its own.
+    # A show only gets a poster/card image from one living in its own root,
+    # so seed that from whichever video's thumbnail we just grabbed -- but
+    # only the first time, so a later re-run for new uploads doesn't clobber
+    # a poster you've since picked yourself in Jellyfin.
+    poster_path = os.path.join(show_dir, "poster.jpg")
+    if not os.path.exists(poster_path):
+        thumbs = sorted(f for f in os.listdir(season_dir) if f.endswith(".jpg"))
+        if thumbs:
+            shutil.copyfile(os.path.join(season_dir, thumbs[0]), poster_path)
+
+    # Jellyfin auto-identifies new items against IMDb/TMDb even with this
+    # library's internet-provider settings off -- so an invented YouTube
+    # title reliably gets fuzzy-matched to some unrelated real show/movie.
+    # Rather than trust that toggle, we correct and hard-lock the metadata
+    # ourselves once Jellyfin has scanned it in.
+    with YOUTUBE_JOBS_LOCK:
+        YOUTUBE_JOBS[job_id]["detail"] = "Downloaded -- fixing Jellyfin identification..."
+    try:
+        _delock_youtube_metadata(safe_title)
+        with YOUTUBE_JOBS_LOCK:
+            YOUTUBE_JOBS[job_id]["detail"] = "Downloaded and Jellyfin metadata corrected."
+    except Exception as e:
+        with YOUTUBE_JOBS_LOCK:
+            YOUTUBE_JOBS[job_id]["detail"] = "Downloaded OK, but Jellyfin metadata cleanup failed: " + str(e)
+
+
+def _jellyfin_get(path):
+    req = urllib.request.Request(f"{JELLYFIN_BASE}{path}", headers={"X-Emby-Token": JELLYFIN_KEY})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def _jellyfin_post(path, body=None):
+    data_bytes = json.dumps(body).encode() if body is not None else b""
+    req = urllib.request.Request(
+        f"{JELLYFIN_BASE}{path}", data=data_bytes, method="POST",
+        headers={"X-Emby-Token": JELLYFIN_KEY, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+_jellyfin_user_id_cache = None
+_youtube_library_id_cache = None
+
+
+def _jellyfin_user_id():
+    global _jellyfin_user_id_cache
+    if not _jellyfin_user_id_cache:
+        users = _jellyfin_get("/Users")
+        _jellyfin_user_id_cache = users[0]["Id"]
+    return _jellyfin_user_id_cache
+
+
+def _youtube_library_id():
+    global _youtube_library_id_cache
+    if not _youtube_library_id_cache:
+        folders = _jellyfin_get("/Library/VirtualFolders")
+        _youtube_library_id_cache = next(f["ItemId"] for f in folders if f["Name"] == "YouTube")
+    return _youtube_library_id_cache
+
+
+def _lock_clean_metadata(item_id, clean_name):
+    """Rewrites an item's identity fields back to the plain local name and
+    hard-locks it (LockData=True) so Jellyfin's scanner leaves it alone on
+    every future scan, not just this one."""
+    uid = _jellyfin_user_id()
+    item = _jellyfin_get(f"/Users/{uid}/Items/{item_id}")
+    item["Name"] = clean_name
+    item["Overview"] = ""
+    item["Genres"] = []
+    item["GenreItems"] = []
+    item["ProviderIds"] = {}
+    item["ExternalUrls"] = []
+    item["Tags"] = []
+    item.pop("ProductionYear", None)
+    item["LockData"] = True
+    _jellyfin_post(f"/Items/{item_id}", item)
+
+
+def _delock_youtube_metadata(safe_title):
+    """Polls for the series Jellyfin just scanned in under /media/youtube/
+    <safe_title>, then strips and locks any auto-matched metadata on it and
+    its episodes. Runs after the download finishes, since Jellyfin's own
+    identification pass needs a few seconds after the file lands."""
+    _jellyfin_post("/Library/Refresh")
+    library_id = _youtube_library_id()
+    expected_path_part = f"/{safe_title}/"
+
+    series_item = None
+    for _ in range(40):
+        time.sleep(3)
+        items = _jellyfin_get(f"/Items?parentId={urllib.parse.quote(library_id)}&recursive=true&includeItemTypes=Series")
+        for item in items.get("Items", []):
+            if expected_path_part in (item.get("Path") or ""):
+                series_item = item
+                break
+        if series_item:
+            break
+    if not series_item:
+        # loud rather than silent -- the caller needs to know this genuinely
+        # didn't happen, not report success when nothing was actually fixed
+        raise TimeoutError(f"Jellyfin never scanned in '{safe_title}' within 120s -- metadata was NOT corrected")
+
+    _lock_clean_metadata(series_item["Id"], safe_title)
+
+    children = _jellyfin_get(f"/Items?parentId={urllib.parse.quote(series_item['Id'])}&recursive=true&includeItemTypes=Episode")
+    for ep in children.get("Items", []):
+        path = ep.get("Path") or ""
+        stem = os.path.splitext(os.path.basename(path))[0]
+        m = re.match(r'^S\d+E\d+ - (.+) \[[^\[\]]+\]$', stem)
+        clean_ep_name = m.group(1) if m else stem
+        _lock_clean_metadata(ep["Id"], clean_ep_name)

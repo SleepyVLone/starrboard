@@ -23,13 +23,14 @@
     <div class="tabs">
         <div class="tab" id="tabShow" onclick="switchType('show')">TV Show</div>
         <div class="tab" id="tabMovie" onclick="switchType('movie')">Movie</div>
+        <div class="tab" id="tabYoutube" onclick="switchType('youtube')">YouTube</div>
     </div>
 
-    <div class="search-row">
+    <div class="search-row" id="searchRow">
         <input class="search-input" id="searchInput" type="text" placeholder="Search for a title&hellip;" oninput="onSearchInput()">
     </div>
 
-    <div class="settings-row">
+    <div class="settings-row" id="settingsRow">
         <label>Quality</label>
         <select id="profileSelect"></select>
         <label>Folder</label>
@@ -41,6 +42,25 @@
                 <option value="anime">Anime</option>
             </select>
         </span>
+    </div>
+
+    <div id="youtubeForm" style="display: none;">
+        <div class="search-row">
+            <input class="search-input" id="ytTitle" type="text" placeholder="Show title (used as the Jellyfin folder name)&hellip;">
+        </div>
+        <div class="search-row">
+            <input class="search-input" id="ytUrl" type="text" placeholder="YouTube channel, playlist, or video URL&hellip;">
+        </div>
+        <div class="settings-row">
+            <label>Quality</label>
+            <select id="ytResolution">
+                <option value="1080p" selected>1080p</option>
+                <option value="720p">720p</option>
+                <option value="best">Best available</option>
+            </select>
+            <button class="add-btn" id="ytSubmitBtn" onclick="submitYoutube()">Download</button>
+        </div>
+        <div id="ytStatus" class="yt-status" style="display: none;"></div>
     </div>
 
     <div id="results"><div class="empty">Start typing to search</div></div>

@@ -151,13 +151,14 @@
 
 import json
 import re
+import subprocess
 import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 
 from arr_common import config
-from arr_common.config import SONARR, RADARR, INSTANCES, QBIT_BASE
+from arr_common.config import SONARR, RADARR, PROWLARR, INSTANCES, QBIT_BASE
 from arr_common.qbittorrent import login as qbit_login
 from arr_common.qbittorrent import get as qbit_get
 from arr_common.state import load_json_state, save_json_state
@@ -460,8 +461,178 @@ def clean_phantom_complete_downloads():
     return "Phantom-completion check:\n" + "\n".join(results)
 
 
+MISSING_SEARCH_STATE_PATH = "/tmp/arr-queue-cleaner-missing-search-state.json"
+MISSING_SEARCH_INTERVAL_HOURS = 20
+MISSING_EPISODE_RESCUE_MAX_PER_RUN = 40  # caps runtime/indexer load; drains a big backlog over several days
+MISSING_EPISODE_RESCUE_PACE_SECONDS = 3  # gap between per-episode indexer calls
+
+
+def rescue_missing_episodes_via_direct_search():
+    """Neither Sonarr nor Radarr has a built-in recurring "search everything
+    that's missing" task (confirmed live 2026-08-03: absent from both apps'
+    own Scheduled Tasks lists, and doesn't register one even after being
+    triggered manually) -- both rely on RSS Sync catching things as they're
+    freshly posted, so anything RSS missed just sits in Wanted forever.
+
+    Sonarr DOES have a built-in "MissingEpisodeSearch" bulk command, but it
+    turned out unreliable at real backlog scale: triggered live 2026-08-03
+    against 524 Wanted episodes, it completed in 8 minutes claiming only 1
+    grabbable report existed -- but a direct per-episode /api/v3/release
+    check run seconds later against several of the exact same "unfindable"
+    episodes (all from one long-running show with a large backlog) turned up
+    8-11 clean, unrejected, well-seeded releases EACH, on Sonarr's own
+    already-configured indexers. The bulk command firing ~524 rapid-fire
+    searches in under 10 minutes almost certainly tripped indexer
+    rate-limiting, silently swallowing most of the results.
+
+    So instead of trusting that bulk command, this does the same thing a
+    human clicking "Search" on one episode at a time would: for each Wanted
+    episode, ask Sonarr's own /api/v3/release for candidates (Sonarr's own
+    quality profile/custom format rejection logic already applies), and if
+    a clean unrejected one exists, grab it directly via the same interactive
+    single-release grab endpoint used elsewhere in this file. Paced with a
+    deliberate gap between requests specifically to avoid repeating the
+    rate-limit problem that broke the bulk command, and capped per run so a
+    huge backlog (100+ missing episodes of one show, in the case that
+    surfaced this) drains over several days rather than hammering every
+    indexer in one burst."""
+    sonarr_name, sonarr_base, sonarr_key = SONARR
+    try:
+        wanted = get(f"{sonarr_base}/api/v3/wanted/missing?pageSize=1000&apikey={sonarr_key}")
+    except Exception as e:
+        return f"Missing-episode rescue: ERROR listing Sonarr wanted episodes: {e}"
+
+    results = []
+    grabbed = 0
+    checked = 0
+
+    for episode in wanted.get("records", []):
+        if checked >= MISSING_EPISODE_RESCUE_MAX_PER_RUN:
+            break
+        episode_id = episode["id"]
+        checked += 1
+        try:
+            releases = get(f"{sonarr_base}/api/v3/release?episodeId={episode_id}&apikey={sonarr_key}")
+        except Exception as e:
+            results.append(f"episode {episode_id}: ERROR checking releases: {e}")
+            time.sleep(MISSING_EPISODE_RESCUE_PACE_SECONDS)
+            continue
+
+        clean = [r for r in releases if not r.get("rejections")]
+        if not clean:
+            time.sleep(MISSING_EPISODE_RESCUE_PACE_SECONDS)
+            continue
+
+        best = max(clean, key=lambda r: (r.get("seeders") or 0))
+        try:
+            req = urllib.request.Request(
+                f"{sonarr_base}/api/v3/release",
+                data=json.dumps({"guid": best["guid"], "indexerId": best["indexerId"]}).encode(),
+                method="POST",
+                headers={"X-Api-Key": sonarr_key, "Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=20)
+            grabbed += 1
+            title = episode.get("series", {}).get("title", "?")
+            results.append(
+                f"GRABBED S{episode.get('seasonNumber')}E{episode.get('episodeNumber')} of '{title}': "
+                f"'{best['title'][:70]}' ({best.get('seeders')} seeders)"
+            )
+        except Exception as e:
+            results.append(f"episode {episode_id}: ERROR grabbing '{best['title'][:60]}': {e}")
+
+        time.sleep(MISSING_EPISODE_RESCUE_PACE_SECONDS)
+
+    if not results:
+        return f"Missing-episode rescue: checked {checked}, nothing grabbable found"
+    return f"Missing-episode rescue: checked {checked}, grabbed {grabbed}:\n" + "\n".join(results)
+
+
+def trigger_missing_content_search():
+    """Companion to rescue_missing_episodes_via_direct_search() above for
+    Radarr's side, which doesn't have the same demonstrated rate-limit
+    problem (Radarr's Wanted list is small) -- its own built-in
+    "MissingMoviesSearch" bulk command is fine to keep using as-is. Runs
+    once a day (not every 30-min cycle) to stay polite to indexers and
+    avoid the kind of long-running command that has wedged Sonarr's queue
+    before (see the SeriesSearch-hang notes elsewhere in this file); the
+    existing stuck-command watchdog in arr-health-check.py already covers
+    recovery if either ever hangs."""
+    state = load_json_state(MISSING_SEARCH_STATE_PATH)
+    now = datetime.now(timezone.utc)
+    last_run = state.get("last_run")
+    if last_run:
+        try:
+            last_dt = datetime.fromisoformat(last_run)
+            if (now - last_dt).total_seconds() < MISSING_SEARCH_INTERVAL_HOURS * 3600:
+                return "Missing-content search: not due yet"
+        except ValueError:
+            pass
+
+    results = []
+    try:
+        req = urllib.request.Request(
+            f"{RADARR[1]}/api/v3/command",
+            data=json.dumps({"name": "MissingMoviesSearch"}).encode(),
+            method="POST",
+            headers={"X-Api-Key": RADARR[2], "Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=15)
+        results.append("Radarr: triggered MissingMoviesSearch")
+    except Exception as e:
+        results.append(f"Radarr: ERROR triggering MissingMoviesSearch: {e}")
+
+    try:
+        results.append(rescue_missing_episodes_via_direct_search())
+    except Exception as e:
+        results.append(f"Sonarr: ERROR in missing-episode rescue: {e}")
+
+    state["last_run"] = now.isoformat()
+    save_json_state(MISSING_SEARCH_STATE_PATH, state)
+    return "Missing-content search: " + "; ".join(results)
+
+
 ORPHAN_MIN_AGE_DAYS = 3
 ORPHAN_LEDGER_PATH = "/tmp/arr-queue-cleaner-orphan-ledger.json"
+
+
+def _diagnose_no_releases(base, key, movie_id):
+    """A one-off, bounded (single request) search to tell "genuinely nothing
+    exists anywhere" apart from "things exist but something is wrongly
+    rejecting all of them" -- found live 2026-08-03: 3 movies from the same
+    anime franchise flagged as orphaned for weeks actually had real MULTi
+    (French+Japanese) releases the whole time, permanently rejected because
+    Radarr's naive title-based language parser saw "FRENCH" in the filename
+    and assumed that was the only audio track, when the required Japanese
+    track was also there. This can't be auto-fixed blindly (the movie's language
+    profile is shared by ~90% of the library, so loosening it isn't a safe
+    unattended action) but naming the actual reason here turns a "why is
+    this stuck" investigation from scratch into a one-line answer."""
+    try:
+        releases = get(f"{base}/api/v3/release?movieId={movie_id}&apikey={key}")
+    except Exception as e:
+        return f"couldn't check available releases: {e}"
+
+    if not releases:
+        return "0 releases found on any indexer -- genuine scarcity, nothing to grab yet"
+
+    clean = [r for r in releases if not r.get("rejections")]
+    if clean:
+        return (
+            f"{len(clean)} release(s) available with NO rejections (e.g. '{clean[0]['title'][:80]}') "
+            f"-- Radarr should have grabbed this already; trigger a manual search"
+        )
+
+    reasons = {}
+    for r in releases:
+        for reason in (r.get("rejections") or []):
+            reasons[reason] = reasons.get(reason, 0) + 1
+    top_reason = max(reasons, key=reasons.get)
+    return (
+        f"{len(releases)} release(s) found but ALL rejected, most commonly: \"{top_reason}\" "
+        f"({reasons[top_reason]}/{len(releases)}) -- check if that rejection is a false positive "
+        f"before assuming the movie is unavailable"
+    )
 
 
 def check_orphaned_additions():
@@ -542,11 +713,11 @@ def check_orphaned_additions():
         key_id = f"radarr:{m['id']}"
         new_ledger[key_id] = True
         if key_id not in ledger:
+            diagnosis = _diagnose_no_releases(radarr_base, radarr_key, m["id"])
             results.append(
                 f"Radarr: ORPHANED MOVIE -- '{m['title']}' added {age_days:.0f}d ago, monitored, "
                 f"available, but ZERO grabs/imports ever (rootFolder={m.get('rootFolderPath')}, "
-                f"qualityProfileId={m.get('qualityProfileId')}) -- check root folder/quality profile, "
-                f"then trigger a manual search"
+                f"qualityProfileId={m.get('qualityProfileId')}) -- {diagnosis}"
             )
 
     save_json_state(ORPHAN_LEDGER_PATH, new_ledger)
@@ -554,6 +725,234 @@ def check_orphaned_additions():
     if not results:
         return "Orphaned additions: nothing found"
     return "Orphaned additions:\n" + "\n".join(results)
+
+
+ORPHAN_AUTOGRAB_LEDGER_PATH = "/tmp/arr-queue-cleaner-orphan-autograb-ledger.json"
+ORPHAN_AUTOGRAB_MIN_SEEDERS = 10
+ORPHAN_AUTOGRAB_MIN_SIZE_BYTES = 200 * 1024 * 1024       # 200MB -- below this is almost certainly a clip/sample, not the film
+ORPHAN_AUTOGRAB_MAX_SIZE_BYTES = 20 * 1024 * 1024 * 1024  # 20GB -- above this is a remux/multi-cut/collection pack, not a normal single grab
+
+# Titles carrying any of these tokens are a foreign dub release as the
+# primary marketed feature (VF/MULTi/FRENCH releases, German/Italian/Spanish
+# dubs). Found live 2026-08-02: the first auto-grab of an anime film picked a
+# well-seeded Nyaa.si release that was the only kind available at the time --
+# every candidate for it was tagged MULTi/VF/FRENCH/VOSTFR, and once it hit
+# Radarr's queue Radarr's own parser correctly flagged it as French audio,
+# not the Japanese audio + English subs the household actually wants. This
+# is the same preference already encoded
+# in Radarr's existing (but here-unused, since a release found this way never
+# passes through Radarr's own release pipeline to be scored by it) "French
+# Audio or Subs (Block)" custom format -- enforced here directly since we're
+# bypassing Radarr's own scoring by construction. Matched as whole words so
+# "VOSTFR" doesn't false-positive on containing "fr", etc.
+UNWANTED_LANGUAGE_TOKENS = {
+    "french", "vf", "vff", "vfq", "vostfr", "multi",
+    "german", "ger", "italian", "ita", "spanish", "latino", "castellano",
+}
+
+
+def has_unwanted_language_tag(title):
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    return bool(words & UNWANTED_LANGUAGE_TOKENS)
+
+
+# A cinema-bootleg source is never what the household wants for a permanent
+# library copy, no matter how well-seeded it is. Found live 2026-08-02: the
+# very next auto-grab after the language fix picked up a CAM-source release
+# (38 seeders, otherwise a perfectly confident title match) for a movie
+# freshly out in cinemas -- recent theatrical releases are exactly when a
+# CAM/TS rip is the only thing seeded at all, so seeders alone will keep
+# picking these unless source quality is filtered too, the same way
+# language was.
+UNWANTED_SOURCE_TOKENS = {
+    "cam", "camrip", "hdcam", "ts", "hdts", "telesync", "tc", "telecine",
+    "scr", "screener", "dvdscr", "r5", "workprint",
+}
+
+
+def has_unwanted_source_tag(title):
+    words = set(re.findall(r"[a-z0-9]+", title.lower()))
+    return bool(words & UNWANTED_SOURCE_TOKENS)
+
+
+def prowlarr_search(query):
+    """A live cross-indexer text search (as opposed to the rest of this file's
+    calls, all local LAN requests to Sonarr/Radarr/qBittorrent) -- Prowlarr has
+    to actually round-trip to each tracker site over the internet, which is
+    usually near-instant but occasionally slow for one indexer, so this gets
+    its own longer timeout rather than sharing get()'s 30s (tuned for local
+    calls) and risking a spurious failure on an otherwise-healthy search."""
+    q = urllib.parse.quote(query)
+    url = f"{PROWLARR[1]}/api/v1/search?query={q}&type=search&apikey={PROWLARR[2]}"
+    with urllib.request.urlopen(url, timeout=45) as r:
+        return json.loads(r.read())
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # tell urllib not to follow -- see resolve_magnet() below for why
+
+
+def resolve_magnet(download_url):
+    """Prowlarr's own /download proxy responds to a torrent-protocol result
+    with a 301 whose Location header IS the magnet URI directly (no .torrent
+    file body at all) -- discovered live fixing a batch of movie grabs on
+    2026-08-01, where `curl -L` silently produced a 0-byte file because
+    curl's redirect-follower doesn't know what to do with
+    a `magnet:` scheme. Building an opener that refuses to auto-follow lets
+    the 301 surface as an HTTPError we can read the Location back out of,
+    instead of urllib trying (and failing) to follow it into a dead end."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(download_url, timeout=15)
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location")
+        if location and location.startswith("magnet:"):
+            return location
+    return None
+
+
+def add_torrent_to_qbit(cookie, magnet, category):
+    data = urllib.parse.urlencode({
+        "urls": magnet, "category": category, "savepath": "/media/downloads/",
+    }).encode()
+    req = urllib.request.Request(f"{QBIT_BASE}/api/v2/torrents/add", data=data, method="POST", headers={"Cookie": cookie})
+    urllib.request.urlopen(req, timeout=30)
+
+
+def rescue_orphaned_movies_via_direct_search():
+    """Companion to check_orphaned_additions() above, Radarr-only. Found live
+    2026-08-01/02: three movies all sat as orphans (zero grabs ever) not
+    because the content didn't exist, but because LimeTorrents was never
+    registered as a Radarr indexer
+    at all (only Sonarr has it) -- Radarr's mandatory live indexer-add test
+    queries with an empty search term, LimeTorrents' feed returns nothing for
+    that specific empty-category-browse query, and Radarr hard-rejects the
+    indexer over it even though real title searches against the same tracker
+    return plenty of well-seeded results. That rejection can't be bypassed
+    (not even with forceSave -- confirmed live, it's a hard error not a
+    warning), so LimeTorrents can never be added as a persistent indexer here.
+    Rather than leave every future case of this needing a manual Prowlarr
+    search + manual qBittorrent add + manual Radarr import, this searches
+    Prowlarr directly (bypassing Radarr's own registered-indexer list
+    entirely, same as a human would from Prowlarr's own search page) for each
+    confirmed orphan, and if a well-seeded single-file match turns up, grabs
+    it straight into qBittorrent under the SAME category Radarr's own grabs
+    use ("movies-radarr") -- meaning rescue_stuck_imports() above picks it up
+    and imports it completely unattended once it finishes, no new import
+    logic needed here at all.
+
+    Movies only, deliberately -- a Sonarr orphan needs per-episode file
+    mapping across potentially hundreds of files (e.g. a long-running YouTube
+    channel archive with a video per day for a year), which is genuinely
+    ambiguous and risky to auto-map blindly; a movie is always exactly one
+    file, so match_missing_movie()
+    already gives an unambiguous yes/no with no guessing involved. One grab
+    attempt per movie, ever (tracked in its own ledger) -- if the best-seeded
+    match turns out to be dead too, that's a real gap needing a human, not
+    something to keep hammering indexers over every 30 minutes."""
+    results = []
+    ledger = load_json_state(ORPHAN_AUTOGRAB_LEDGER_PATH)
+    new_ledger = {}
+    now_utc = datetime.now(timezone.utc)
+
+    radarr_name, radarr_base, radarr_key = RADARR
+    try:
+        movies = radarr_movies(radarr_base, radarr_key)
+    except Exception as e:
+        return f"Orphan auto-grab: ERROR listing Radarr movies: {e}"
+
+    cookie = None
+
+    for m in movies:
+        if not m.get("monitored") or m.get("hasFile") or not m.get("isAvailable"):
+            continue
+        try:
+            added = datetime.fromisoformat(m.get("added", "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        age_days = (now_utc - added).total_seconds() / 86400
+        if age_days < ORPHAN_MIN_AGE_DAYS:
+            continue
+        try:
+            history = get(f"{radarr_base}/api/v3/history/movie?movieId={m['id']}&apikey={radarr_key}")
+        except Exception as e:
+            results.append(f"'{m['title']}': ERROR checking history: {e}")
+            continue
+        if history:
+            continue  # a real availability gap, not this bug class
+
+        key_id = f"radarr:{m['id']}"
+        if key_id in ledger:
+            new_ledger[key_id] = True
+            continue  # already attempted once -- see docstring on why this doesn't retry forever
+
+        try:
+            candidates = prowlarr_search(f"{m['title']} {m.get('year', '')}".strip())
+        except Exception as e:
+            results.append(f"'{m['title']}': ERROR searching Prowlarr directly: {e}")
+            continue
+
+        best = None
+        for r in candidates:
+            if r.get("protocol") != "torrent":
+                continue
+            # Which field actually resolves to something grabbable varies by
+            # indexer -- LimeTorrents/YTS use "downloadUrl", Knaben/Nyaa.si use
+            # "magnetUrl" instead (found live comparing earlier successful
+            # grabs against a search that only turned up Nyaa.si results:
+            # every one of them had "downloadUrl" entirely absent, which
+            # meant they were all silently skipped even though some had
+            # fine seeder counts). Try both rather than assuming one.
+            if not (r.get("downloadUrl") or r.get("magnetUrl")):
+                continue
+            if has_unwanted_language_tag(r.get("title", "")):
+                continue
+            if has_unwanted_source_tag(r.get("title", "")):
+                continue
+            size = r.get("size") or 0
+            if not (ORPHAN_AUTOGRAB_MIN_SIZE_BYTES <= size <= ORPHAN_AUTOGRAB_MAX_SIZE_BYTES):
+                continue
+            if (r.get("seeders") or 0) < ORPHAN_AUTOGRAB_MIN_SEEDERS:
+                continue
+            if not match_missing_movie(r.get("title", ""), [m]):
+                continue  # title doesn't cleanly prefix-match this exact movie -- skip, don't guess
+            if best is None or (r.get("seeders") or 0) > (best.get("seeders") or 0):
+                best = r
+
+        if best is None:
+            continue  # nothing well-seeded and confidently matched -- leave for manual review, as before
+
+        try:
+            magnet = resolve_magnet(best.get("downloadUrl") or best["magnetUrl"])
+        except Exception as e:
+            results.append(f"'{m['title']}': ERROR resolving magnet from {best.get('indexer')}: {e}")
+            continue
+        if not magnet:
+            results.append(f"'{m['title']}': found '{best['title'][:70]}' on {best.get('indexer')} but couldn't resolve a magnet URI")
+            continue
+
+        try:
+            if cookie is None:
+                cookie = qbit_login()
+            add_torrent_to_qbit(cookie, magnet, RESCUE_CATEGORIES["Radarr"])
+        except Exception as e:
+            results.append(f"'{m['title']}': ERROR adding torrent to qBittorrent: {e}")
+            continue
+
+        new_ledger[key_id] = True
+        results.append(
+            f"AUTO-GRABBED: '{m['title']}' had zero grabs in {age_days:.0f}d (Radarr's own indexers "
+            f"never returned anything) -> found '{best['title'][:70]}' on {best.get('indexer')} "
+            f"({best.get('seeders')} seeders, {(best.get('size') or 0)/1e9:.1f}GB) via direct Prowlarr "
+            f"search -> queued in qBittorrent, will auto-import once complete"
+        )
+
+    save_json_state(ORPHAN_AUTOGRAB_LEDGER_PATH, new_ledger)
+
+    if not results:
+        return "Orphan auto-grab: nothing to grab"
+    return "Orphan auto-grab:\n" + "\n".join(results)
 
 
 EXECUTABLE_EXTENSIONS = (".exe", ".scr", ".bat", ".cmd", ".com", ".msi")
@@ -981,6 +1380,101 @@ def clear_stale_queue_entries(base, key, target_hash):
     urllib.request.urlopen(req, timeout=30)
 
 
+UPDATE_LEDGER_PATH = "/tmp/arr-queue-cleaner-update-ledger.json"
+DOCKER_SERVICE_FOR_APP = {"Sonarr": "sonarr", "Radarr": "radarr"}
+CONFIG_BACKUP_DIR = "/opt/media/config-backups"
+COMPOSE_DIR = "/opt/media"
+
+
+def pct_exec(args, timeout=300):
+    return subprocess.run(
+        ["/usr/sbin/pct", "exec", "100", "--"] + args,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def apply_app_update(name, base, key):
+    """Backs up the app's config directory, pulls the new image, recreates
+    the container, then polls the API until it actually responds with a
+    version string before declaring success -- mirrors exactly the manual
+    steps used for the first Radarr 6.2.1->6.3.0 update on 2026-08-02 (config
+    tarred to /opt/media/config-backups first, `docker compose pull` +
+    `docker compose up -d`, then poll /system/status). Returns (ok, detail)."""
+    service = DOCKER_SERVICE_FOR_APP[name]
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    pct_exec(["mkdir", "-p", CONFIG_BACKUP_DIR])
+    backup_path = f"{CONFIG_BACKUP_DIR}/{service}-pre-update-{ts}.tar.gz"
+    r = pct_exec(["tar", "czf", backup_path, "-C", "/opt/media/config", service])
+    if r.returncode != 0:
+        return False, f"config backup failed, aborting update: {r.stderr.strip()[-300:]}"
+
+    r = pct_exec(["bash", "-c", f"cd {COMPOSE_DIR} && docker compose pull {service}"], timeout=300)
+    if r.returncode != 0:
+        return False, f"image pull failed (config backed up to {backup_path}): {r.stderr.strip()[-300:]}"
+
+    r = pct_exec(["bash", "-c", f"cd {COMPOSE_DIR} && docker compose up -d {service}"], timeout=120)
+    if r.returncode != 0:
+        return False, f"container recreate failed (config backed up to {backup_path}): {r.stderr.strip()[-300:]}"
+
+    for _ in range(20):  # ~60s
+        time.sleep(3)
+        try:
+            status = get(f"{base}/api/v3/system/status?apikey={key}")
+            if status.get("version"):
+                return True, status["version"]
+        except Exception:
+            continue
+    return False, f"container did not come back healthy within 60s (config backed up to {backup_path})"
+
+
+def check_app_updates():
+    """Companion to arr-health-check.py's check_app_health(): that one only
+    ever logs a Sonarr/Radarr UpdateCheck warning since applying it there
+    would mean a heavy docker pull/recreate on the fast 10-minute cadence.
+    Here on the 30-minute maintenance cadence, actually apply it -- full
+    auto-apply was an explicit choice made after doing the first Radarr
+    update by hand (config backup, pull, recreate, verify healthy) to
+    confirm the exact steps work on this stack. One attempt per
+    exact version string, ever (ledger-gated) -- a failed/incompatible
+    update isn't something to keep retrying every 30 minutes, that needs a
+    person, so it's logged loudly (still with the config safely backed up
+    beforehand) rather than hammered at repeatedly."""
+    results = []
+    ledger = load_json_state(UPDATE_LEDGER_PATH)
+    new_ledger = {}
+
+    for name, base, key in INSTANCES:
+        if name not in DOCKER_SERVICE_FOR_APP:
+            continue
+        try:
+            health = get(f"{base}/api/v3/health?apikey={key}")
+        except Exception as e:
+            results.append(f"{name}: ERROR checking for updates: {e}")
+            continue
+
+        for item in health:
+            if item.get("source") != "UpdateCheck":
+                continue
+            message = item.get("message", "")
+            key_id = f"{name}:{message}"
+            new_ledger[key_id] = True
+            if key_id in ledger:
+                continue  # already attempted this exact version once
+
+            ok, detail = apply_app_update(name, base, key)
+            if ok:
+                results.append(f"{name}: AUTO-UPDATED -- {message} -> now running {detail}, verified healthy")
+            else:
+                results.append(f"{name}: UPDATE FAILED -- {message} -> {detail}. NEEDS MANUAL ATTENTION.")
+
+    save_json_state(UPDATE_LEDGER_PATH, new_ledger)
+
+    if not results:
+        return "App updates: nothing to apply"
+    return "App updates:\n" + "\n".join(results)
+
+
 def rescue_stuck_imports():
     cookie = qbit_login()
     results = []
@@ -1298,9 +1792,24 @@ def main():
         print(f"Disk space: ERROR: {e}")
 
     try:
+        print(rescue_orphaned_movies_via_direct_search())
+    except Exception as e:
+        print(f"Orphan auto-grab: ERROR: {e}")
+
+    try:
         print(check_orphaned_additions())
     except Exception as e:
         print(f"Orphaned additions: ERROR: {e}")
+
+    try:
+        print(check_app_updates())
+    except Exception as e:
+        print(f"App updates: ERROR: {e}")
+
+    try:
+        print(trigger_missing_content_search())
+    except Exception as e:
+        print(f"Missing-content search: ERROR: {e}")
 
 
 if __name__ == "__main__":

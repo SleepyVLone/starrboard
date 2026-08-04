@@ -590,6 +590,12 @@ body::before
     background: rgba(245, 151, 139, 0.16);
 }
 
+.dl-source.YouTube
+{
+    color: var(--star);
+    background: rgba(255, 246, 223, 0.16);
+}
+
 .cmd-source
 {
     display: inline-block;

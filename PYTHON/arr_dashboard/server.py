@@ -146,6 +146,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(data.get_server_health())
         elif path == "/api/commands":
             self._send_json(data.get_command_queue())
+        elif path == "/api/youtube-status":
+            job_id = query.get("id", [""])[0]
+            with data.YOUTUBE_JOBS_LOCK:
+                job = data.YOUTUBE_JOBS.get(job_id)
+            if not job:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self._send_json(job)
         else:
             self.send_response(404)
             self.end_headers()
@@ -162,6 +171,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("type must be 'show' or 'movie'")
                 result = data.add_media(kind, body)
                 self._send_json({"ok": True, "title": result.get("title")})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)})
+        elif path == "/api/add-youtube":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                job_id = data.start_youtube_download(body.get("title"), body.get("url"), body.get("resolution"))
+                self._send_json({"ok": True, "job_id": job_id})
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)})
         else:
