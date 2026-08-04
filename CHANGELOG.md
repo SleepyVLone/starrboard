@@ -10,13 +10,21 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.2.1
+
+**Fixed: `check_app_health()` never cleared a blanket "all indexers unavailable" warning.**
+
+The original implementation only handled health messages naming one specific indexer ("Indexers unavailable due to failures: Knaben"), extracting the name after the colon and testing just that one. Found live 2026-08-03 that a rate-limit event can also produce three blanket, no-name-attached warnings at once ("All indexers are unavailable due to failures", plus matching RSS/search variants) -- the name-extraction regex had nothing to grab from those, so it silently tested nothing and the warnings sat stale indefinitely even once every indexer was actually healthy again. It also turned out a plain `CheckHealth` command alone doesn't clear the flag either -- each indexer genuinely needs a direct test through the app's own `/indexer/test` endpoint first, which is what actually resets its internal per-indexer backoff state.
+
+Now tests every currently-enabled indexer once per run for any of the three warning sources, regardless of which message shape triggered it, and only fires the CheckHealth/RssSync refresh once all of them pass.
+
 ## v1.2.0
 
 **Added: `check_indexer_rate_limits()` to `arr-health-check.py`.**
 
 Found live 2026-08-03: a freshly-added movie's automatic on-add search genuinely found real, well-seeded releases (confirmed separately via a direct interactive release check) but failed to grab a single one, because one indexer was returning HTTP 429 (Too Many Requests) for every attempt. The item just sat in Wanted looking exactly like nothing had happened -- not a health warning, not an error anyone would think to go looking for, and (per a live report) something that had been happening more and more often lately. This scans each app's own recent log for that exact signature and logs plainly which indexer and how many attempts failed. Deliberately doesn't retry immediately -- the indexer is correctly refusing more requests right now, so hammering it again would just repeat the failure -- the existing daily missing-content search already retries anything still missing once the rate-limit window resets on its own. Deduped per hour so a burst spanning several 10-minute checks in a row is only logged once.
 
-Also set conservative query/grab limits directly on every active indexer in Prowlarr (self-throttling well below whatever the trackers' own hard limits turn out to be), as the primary defence -- this new check is meant to catch the rare case that still slips through, not to be the only thing standing between normal use and a rate-limit ban.
+Also briefly set conservative query/grab limits directly on every active indexer in Prowlarr as a preventative measure. That was reverted the same day: the limits were set without first checking each indexer's actual usage so far that day, so Prowlarr's own newly-configured ceiling was already below current usage the moment it was applied -- instead of quietly preventing a future problem, it immediately blocked every request to three indexers at once and escalated a single-indexer rate-limit into "all indexers unavailable" on both apps. Confirmed by reverting the limits and watching all three indexers pass a live test immediately afterward. Left unset going forward; the detection above is the actual defence, not a guessed-at ceiling.
 
 ## v1.1.0
 

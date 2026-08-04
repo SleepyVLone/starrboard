@@ -389,6 +389,9 @@ def app_post(base, key, path, body):
         return json.loads(raw) if raw else {}
 
 
+INDEXER_HEALTH_SOURCES = ("IndexerStatusCheck", "IndexerRssCheck", "IndexerSearchCheck")
+
+
 def check_app_health(state):
     """Sonarr/Radarr's own built-in health page (IndexerStatusCheck etc.) is
     exactly the kind of thing a non-technical family member would never think
@@ -401,12 +404,26 @@ def check_app_health(state):
     exactly as broken as a real, permanent problem would, with no visible
     difference between "will fix itself" and "needs a person."
 
-    Live-tests the named indexer through the app's own /indexer/test right
-    now. If it's actually fine again, fires CheckHealth + RssSync so the
-    warning has the best chance of clearing immediately instead of sitting
-    stale for its full backoff window. If it's still genuinely down, leaves
-    it alone and logs it plainly -- a real external tracker outage isn't
-    something to paper over or retry aggressively.
+    Originally only handled the single-named-indexer message shape
+    ("Indexers unavailable due to failures: Knaben"). Found live 2026-08-03
+    that a real rate-limit event can also produce three blanket,
+    no-name-attached warnings at once (IndexerStatusCheck's "All indexers
+    are unavailable due to failures", plus matching IndexerRssCheck/
+    IndexerSearchCheck ones) -- the original name-extraction regex had
+    nothing to grab from those, so it silently tested nothing and never
+    cleared them; confirmed by hand that once every indexer was actually
+    healthy again, they needed a direct per-indexer test (not just a
+    CheckHealth command) before the flags would clear at all.
+
+    So instead of trying to parse which indexer(s) a message names, this
+    just tests every currently-enabled indexer once per run, for any of the
+    three warning sources above -- cheap, and correct regardless of which
+    message shape shows up. If all of them test healthy, fires CheckHealth +
+    RssSync so the warning has the best chance of clearing immediately
+    instead of sitting stale for its own backoff window. If any are still
+    genuinely down, leaves it alone and logs which ones plainly -- a real
+    external tracker outage isn't something to paper over or retry
+    aggressively.
 
     (Sonarr/Radarr's UpdateCheck warning is handled separately, in
     arr-queue-cleaner.py's check_app_updates() -- applying an update means
@@ -421,38 +438,46 @@ def check_app_health(state):
             results.append(f"{name} health check: ERROR: {e}")
             continue
 
-        for item in health:
-            if item.get("source") != "IndexerStatusCheck":
-                continue
-            message = item.get("message", "")
-            m = re.search(r":\s*(.+)$", message)
-            indexer_name = m.group(1).strip() if m else message
-            healthy_now = False
-            try:
-                indexers = app_get(base, key, "/api/v3/indexer")
-                for idx in indexers:
-                    if idx.get("name") == indexer_name:
-                        test_result = app_post(base, key, "/api/v3/indexer/test", idx)
-                        healthy_now = not test_result
-                        break
-            except Exception:
-                healthy_now = False
+        indexer_items = [item for item in health if item.get("source") in INDEXER_HEALTH_SOURCES]
+        if not indexer_items:
+            continue
 
-            if healthy_now:
-                try:
-                    app_post(base, key, "/api/v3/command", {"name": "CheckHealth"})
-                    app_post(base, key, "/api/v3/command", {"name": "RssSync"})
-                    results.append(
-                        f"{name} health: '{indexer_name}' was flagged unavailable but tests healthy again "
-                        f"right now -> triggered a health/RSS refresh so the warning clears itself"
-                    )
-                except Exception as e:
-                    results.append(f"{name} health: '{indexer_name}' recovered but ERROR triggering refresh: {e}")
-            else:
+        try:
+            indexers = app_get(base, key, "/api/v3/indexer")
+        except Exception as e:
+            results.append(f"{name} health: ERROR listing indexers to test: {e}")
+            continue
+
+        enabled = [
+            idx for idx in indexers
+            if idx.get("enableRss") or idx.get("enableAutomaticSearch") or idx.get("enableInteractiveSearch")
+        ]
+        still_down = []
+        for idx in enabled:
+            try:
+                test_result = app_post(base, key, "/api/v3/indexer/test", idx)
+                if test_result:  # a non-empty response means validation failures
+                    still_down.append(idx["name"])
+            except Exception:
+                still_down.append(idx["name"])
+
+        messages = "; ".join(item["message"] for item in indexer_items)
+
+        if not still_down:
+            try:
+                app_post(base, key, "/api/v3/command", {"name": "CheckHealth"})
+                app_post(base, key, "/api/v3/command", {"name": "RssSync"})
                 results.append(
-                    f"{name} health: {message} (still down when tested just now -- external tracker "
-                    f"outage, not a config issue; will clear on its own once the tracker recovers)"
+                    f"{name} health: {messages} -- every enabled indexer tests healthy again right now "
+                    f"-> triggered a health/RSS refresh so the warning clears itself"
                 )
+            except Exception as e:
+                results.append(f"{name} health: indexers recovered but ERROR triggering refresh: {e}")
+        else:
+            results.append(
+                f"{name} health: {messages} (still down when tested just now: {', '.join(still_down)} -- "
+                f"external tracker outage, not a config issue; will clear on its own once the tracker recovers)"
+            )
 
     return results
 
