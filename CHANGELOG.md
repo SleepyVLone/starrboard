@@ -10,6 +10,25 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.2.3
+
+**Fixed: the orphaned-download rescue re-imported the same Radarr movie every 30 minutes, forever.**
+
+Found live 2026-08-04 while reviewing the cron log: the same "imported 1 file(s) from orphaned completed download" line had been logged on 41 consecutive runs for one movie. Its Radarr history showed 69 cycles of `movieFileDeleted` immediately followed by `downloadFolderImported`, going back to the point the merged codebase was first deployed the day before -- so for roughly 34 hours Radarr had been deleting an already-imported movie file and re-copying an identical one from the downloads folder, twice an hour, around 1.3 GB a time.
+
+Two causes stacked on top of each other:
+
+- The movie object returned by Radarr's `/manualimport` scan never populates `hasFile` -- it is always null, unlike the same movie fetched from `/api/v3/movie`. The Radarr branch of `rescue_stuck_imports()` read it directly, so `not hasFile` was true for *every* completed download and each one looked like it still needed importing. `hasFile` is now resolved from the real library record instead; a scan that matches a movie id which isn't in the library goes to manual review rather than being imported on a guess.
+- The `already_imported()` guard that should have caught the repeat matches history on `downloadId`, but a ManualImport submitted by this script is recorded by Radarr with a null `downloadId`. The guard can therefore never recognise the rescue's own past imports, which is why nothing stopped the loop. Left as-is deliberately: matching on the release name instead would wrongly suppress a genuinely needed re-import after a file is deleted for a real reason, and the `hasFile` fix above already closes the loop.
+
+The Sonarr branch was never affected -- Sonarr's `/manualimport` scan does populate `hasFile` on each episode, which is what kept the equivalent check there honest. Verified against the live instance both ways before and after the fix, and covered by new regression tests that reproduce the exact scan shape Radarr returns.
+
+**Also: a completed download that is the file already imported now gets cleaned up instead of sitting there indefinitely.**
+
+Fixing the loop above left a second question behind -- imports are done by copy, so a download that has already been imported stays in the downloads folder looking permanently unfinished, and would otherwise be rescanned every 30 minutes forever. The existing "redundant duplicate" cleanup (which already covered downloads Radarr couldn't identify at all) now covers this case too, but only when the download is byte-identical to what the library holds: same filename *and* same exact size. Anything else -- a different size, a different release name -- could be a real upgrade that failed to import, so it is never deleted on a guess; it goes to manual review once, via the existing ledger, and waits for a human.
+
+New tests cover all four outcomes: skip, import, delete, and hand to a human.
+
 ## v1.2.2
 
 **Fixed: `check_indexer_rate_limits()`'s indexer-name extraction could pick up an unrelated line.**

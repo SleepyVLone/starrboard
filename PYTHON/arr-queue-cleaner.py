@@ -150,6 +150,7 @@
 #     once, not every 30 minutes forever.
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -1336,6 +1337,27 @@ def match_missing_movie(download_name, movies):
     return [m for n, m in matched if n == longest]
 
 
+def is_same_file_as_library(scan_item, library_movie):
+    """True when a completed download is the very file already imported for that
+    movie -- same filename and same exact byte size. Imports are done by copy, so
+    a download that has already been imported still sits in the downloads folder
+    looking unfinished forever; matching on both name and size is specific enough
+    to call that a spent duplicate without ever mistaking a different release
+    (a real upgrade, a different cut) for one."""
+    movie_file = library_movie.get("movieFile") or {}
+    library_name = os.path.basename(movie_file.get("relativePath") or "")
+    download_name = os.path.basename(scan_item.get("relativePath") or "")
+    if not library_name or not download_name:
+        return False
+    if library_name != download_name:
+        return False
+    library_size = movie_file.get("size")
+    download_size = scan_item.get("size")
+    if not library_size or not download_size:
+        return False  # can't confirm -> don't delete anything
+    return library_size == download_size
+
+
 def submit_manual_import(base, key, files, import_mode="copy"):
     """Submits the import and waits (up to ~60s) for the async command to finish,
     so callers can tell whether it's safe to clear the matching queue entry."""
@@ -1556,14 +1578,60 @@ def rescue_stuck_imports():
                         continue
                 else:  # Radarr
                     if not rejections and item.get("movie"):
-                        if not item["movie"].get("hasFile"):
+                        # The movie object returned by Radarr's manual-import
+                        # scan never populates hasFile -- it is always null,
+                        # unlike the same movie fetched from /api/v3/movie.
+                        # Reading it directly therefore made EVERY completed
+                        # Radarr download look like it was still missing its
+                        # file, so this rescue re-imported the same download
+                        # on every run: Radarr deleted the existing movie file
+                        # and re-copied an identical one from the downloads
+                        # folder every 30 minutes, indefinitely. Hit live on
+                        # one movie for ~34 hours (69 pointless import cycles)
+                        # before it was spotted. Always resolve hasFile from
+                        # the real library record instead.
+                        if movies_cache is None:
+                            try:
+                                movies_cache = radarr_movies(base, key)
+                            except Exception as e:
+                                needs_review.append(f"{item.get('relativePath')}: ERROR loading movie library: {e}")
+                                continue
+                        library = next(
+                            (m for m in movies_cache if m.get("id") == item["movie"]["id"]), None
+                        )
+                        if library is None:
+                            # Scan matched a movie we can't find in the library
+                            # -- can't confirm it's genuinely missing, so don't
+                            # guess.
+                            needs_review.append(
+                                f"{item.get('relativePath')}: matched movie id "
+                                f"{item['movie']['id']} is not in the Radarr library"
+                            )
+                            continue
+                        if not library.get("hasFile"):
                             safe_files.append({
                                 "path": item["path"],
-                                "movieId": item["movie"]["id"],
+                                "movieId": library["id"],
                                 "quality": item["quality"],
                                 "languages": item["languages"],
                                 "indexerFlags": item.get("indexerFlags", 0),
                             })
+                            continue
+
+                        # The library already has this movie's file, so there is
+                        # nothing to rescue. If the download is byte-identical to
+                        # the file already imported, it's a spent duplicate and
+                        # can be cleaned up; anything else might be a genuine
+                        # upgrade that failed to import, which is a human's call.
+                        if is_same_file_as_library(item, library):
+                            redundant = True
+                        else:
+                            needs_review.append(
+                                f"{item.get('relativePath')}: completed, but "
+                                f"'{library.get('title')}' already has a different file "
+                                f"({(library.get('movieFile') or {}).get('relativePath')}) -- "
+                                f"import by hand if this one is meant to replace it"
+                            )
                         continue
 
                     # "Unknown Movie": Radarr couldn't parse a movie identity
