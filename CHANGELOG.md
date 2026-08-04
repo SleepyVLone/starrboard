@@ -10,6 +10,12 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.2.2
+
+**Fixed: `check_indexer_rate_limits()`'s indexer-name extraction could pick up an unrelated line.**
+
+Confirmed live: a generic log line mentioning "...or your indexer category settings." got matched as if "category settings." were the indexer name, producing a garbled "Knaben, or your indexer category settings." in the log instead of just "Knaben". Real indexer names always start with an uppercase letter or digit; the extraction regex now requires that, which excludes this kind of incidental lowercase match.
+
 ## v1.2.1
 
 **Fixed: `check_app_health()` never cleared a blanket "all indexers unavailable" warning.**

@@ -482,7 +482,7 @@ def check_app_health(state):
     return results
 
 
-INDEXER_NAME_RE = re.compile(r"[Ii]ndexer (\w[\w. ]*?)(?:\s*\(Prowlarr\)|:|$)")
+INDEXER_NAME_RE = re.compile(r"[Ii]ndexer ([A-Z0-9][\w. ]*?)(?:\s*\(Prowlarr\)|:|$)")
 RATE_LIMIT_WINDOW_SECONDS = 10 * 60  # matches this check's own 10-minute cadence
 
 
