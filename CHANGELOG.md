@@ -10,6 +10,14 @@ Newest first. Each release is tagged `vX.Y.Z`.
 
 ---
 
+## v1.2.0
+
+**Added: `check_indexer_rate_limits()` to `arr-health-check.py`.**
+
+Found live 2026-08-03: a freshly-added movie's automatic on-add search genuinely found real, well-seeded releases (confirmed separately via a direct interactive release check) but failed to grab a single one, because one indexer was returning HTTP 429 (Too Many Requests) for every attempt. The item just sat in Wanted looking exactly like nothing had happened -- not a health warning, not an error anyone would think to go looking for, and (per a live report) something that had been happening more and more often lately. This scans each app's own recent log for that exact signature and logs plainly which indexer and how many attempts failed. Deliberately doesn't retry immediately -- the indexer is correctly refusing more requests right now, so hammering it again would just repeat the failure -- the existing daily missing-content search already retries anything still missing once the rate-limit window resets on its own. Deduped per hour so a burst spanning several 10-minute checks in a row is only logged once.
+
+Also set conservative query/grab limits directly on every active indexer in Prowlarr (self-throttling well below whatever the trackers' own hard limits turn out to be), as the primary defence -- this new check is meant to catch the rare case that still slips through, not to be the only thing standing between normal use and a rate-limit ban.
+
 ## v1.1.0
 
 **Added: a YouTube tab on the Add page, with its own download pipeline.**

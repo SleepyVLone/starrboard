@@ -457,6 +457,93 @@ def check_app_health(state):
     return results
 
 
+INDEXER_NAME_RE = re.compile(r"[Ii]ndexer (\w[\w. ]*?)(?:\s*\(Prowlarr\)|:|$)")
+RATE_LIMIT_WINDOW_SECONDS = 10 * 60  # matches this check's own 10-minute cadence
+
+
+def check_indexer_rate_limits(state):
+    """Sonarr/Radarr's own health page never flags this at all -- discovered
+    live 2026-08-03 when a freshly-added movie's automatic on-add search
+    genuinely found real, well-seeded releases (confirmed separately via a
+    direct interactive release check) but failed to grab a single one,
+    because Knaben (reached through Prowlarr) was returning HTTP 429 (Too
+    Many Requests) / "API Grab Limit reached" for every attempt. The item
+    just sat in Wanted looking exactly like nothing had happened, with
+    nothing anywhere saying why -- not a health warning, not an error a
+    non-technical family member would ever think to go looking for.
+
+    Scans each app's own recent log for that exact signature. Deliberately
+    does NOT retry immediately -- the indexer is (correctly) refusing more
+    requests right now, so hammering it again would just repeat the same
+    failure. The existing daily missing-content search in
+    arr-queue-cleaner.py already retries anything still missing once the
+    rate-limit window has reset on its own, so this is visibility-only,
+    deduped per hour so a rate-limit burst that spans several 10-minute
+    checks in a row is only logged once, not every cycle.
+
+    Also: Knaben, LimeTorrents, Nyaa.si, and YTS all had conservative
+    query/grab limits configured directly in Prowlarr the same day this was
+    found (100-150 queries and 50-75 grabs per day, self-throttling well
+    below whatever the trackers' own hard limits turn out to be), so this is
+    meant to catch the rare case that still slips through, not to be the
+    primary defence."""
+    results = []
+    now_utc = datetime.now(timezone.utc)
+    ledger = state.get("rate_limit_ledger", {})
+    hour_bucket = now_utc.strftime("%Y-%m-%d-%H")
+
+    for name, base, key in APPS:
+        try:
+            log = app_get(base, key, "/api/v3/log?pageSize=200&sortKey=time&sortDirection=descending")
+        except Exception as e:
+            results.append(f"{name} indexer rate-limit check: ERROR reading log: {e}")
+            continue
+
+        hits = []
+        named_entries = []  # every recent entry, regardless of exact wording, to pull the indexer name from
+        for entry in log.get("records", []):
+            try:
+                ts = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
+            except (ValueError, KeyError):
+                continue
+            if (now_utc - ts).total_seconds() > RATE_LIMIT_WINDOW_SECONDS:
+                continue
+            named_entries.append(entry)
+            message = entry.get("message", "")
+            if "429" in message or "Grab Limit" in message:
+                hits.append(entry)
+
+        if not hits:
+            continue
+
+        # The line that actually says "429"/"Grab Limit" is usually a raw
+        # HTTP-layer message with no indexer name in it at all -- the name
+        # only shows up on the neighbouring "Couldn't add release ... from
+        # Indexer X" line a few log entries away, so the name has to come
+        # from the whole recent window, not just the hit lines themselves.
+        indexer_names = set()
+        for entry in named_entries:
+            m = INDEXER_NAME_RE.search(entry.get("message", ""))
+            if m:
+                indexer_names.add(m.group(1).strip())
+        who = ", ".join(sorted(indexer_names)) if indexer_names else "an indexer"
+
+        ledger_key = f"{hour_bucket}:{name}:{who}"
+        if ledger_key in ledger:
+            continue
+        ledger[ledger_key] = True
+
+        results.append(
+            f"{name}: {who} is rate-limiting requests ({len(hits)} failed grab/search attempt(s) in the "
+            f"last {RATE_LIMIT_WINDOW_SECONDS // 60}min) -- searches will keep finding releases but failing "
+            f"to grab them until the indexer's own limit window resets. Nothing to fix by hand; the daily "
+            f"missing-content search will pick up anything still missing automatically once it clears."
+        )
+
+    state["rate_limit_ledger"] = ledger
+    return results
+
+
 def main():
     now = time.time()
     state = load_json_state(STATE_FILE)
@@ -476,6 +563,7 @@ def main():
         ("Transfer speed check", lambda: check_transfer_speed(state, now)),
         ("Command queue check", lambda: check_stuck_commands(state, now)),
         ("App health check", lambda: check_app_health(state)),
+        ("Indexer rate-limit check", lambda: check_indexer_rate_limits(state)),
     ):
         try:
             results.extend(fn())
