@@ -549,16 +549,117 @@ def rescue_missing_episodes_via_direct_search():
     return f"Missing-episode rescue: checked {checked}, grabbed {grabbed}:\n" + "\n".join(results)
 
 
+MISSING_MOVIE_RESCUE_MAX_PER_RUN = 40  # caps runtime/indexer load; drains a big backlog over several days
+MISSING_MOVIE_RESCUE_PACE_SECONDS = 3  # gap between per-movie indexer calls
+
+
+def rescue_missing_movies_via_direct_search():
+    """Companion to rescue_missing_episodes_via_direct_search() above, but for
+    Radarr's Wanted/Missing movies. Radarr was originally assumed to be
+    exempt from the bulk-search rate-limit problem described above
+    ("Radarr's Wanted list is small... its own built-in MissingMoviesSearch
+    bulk command is fine to keep using as-is") -- confirmed wrong live
+    2026-08-06 with "I, Robot" (2004). Its on-add automatic search found
+    roughly 14 good candidate releases, all from indexer Knaben (via
+    Prowlarr), and Radarr's own ProcessDownloadDecisions cascaded grab
+    attempts across them multiple times a second as earlier ones failed. A
+    couple of failures early in that burst tripped Prowlarr's own
+    circuit-breaker, which disabled Knaben for about a minute -- and every
+    OTHER candidate release still queued in that same burst then failed
+    too, for the same reason, not because anything was actually wrong with
+    them. The movie ended up with zero successful grabs and (per
+    /api/v3/history/movie) a completely empty history, sitting in Wanted
+    forever with nothing anywhere explaining why -- Radarr never retries a
+    Wanted item on its own once this happens. The same 429/Knaben signature
+    turned up recently on other movies too (Stuart Little, Fist Fight, and
+    more), so this is a recurring pattern, not a one-off.
+
+    MissingMoviesSearch is exactly as capable of triggering this burst as
+    Sonarr's MissingEpisodeSearch was -- both fire a rapid-fire batch of
+    searches internally with no pacing of their own. So this does the same
+    thing that fixed Sonarr: check Radarr's own /api/v3/release for each
+    Wanted movie one at a time (Radarr's own quality profile/custom format
+    rejection logic already applies), and if a clean unrejected candidate
+    exists, grab it directly via the same interactive single-release grab
+    endpoint used elsewhere in this file, rather than letting Radarr's bulk
+    search decide. Paced and capped per run for the same reason as the
+    Sonarr version -- never issuing a burst of our own that could re-trip
+    the exact breaker this exists to work around."""
+    radarr_name, radarr_base, radarr_key = RADARR
+    try:
+        movies = radarr_movies(radarr_base, radarr_key)
+    except Exception as e:
+        return f"Missing-movie rescue: ERROR listing Radarr movies: {e}"
+
+    wanted = [
+        m for m in movies
+        if m.get("monitored") and m.get("isAvailable") and not m.get("hasFile")
+    ]
+
+    results = []
+    grabbed = 0
+    checked = 0
+
+    for movie in wanted:
+        if checked >= MISSING_MOVIE_RESCUE_MAX_PER_RUN:
+            break
+        movie_id = movie["id"]
+        checked += 1
+        try:
+            releases = get(f"{radarr_base}/api/v3/release?movieId={movie_id}&apikey={radarr_key}")
+        except Exception as e:
+            results.append(f"movie {movie_id}: ERROR checking releases: {e}")
+            time.sleep(MISSING_MOVIE_RESCUE_PACE_SECONDS)
+            continue
+
+        clean = [r for r in releases if not r.get("rejections")]
+        if not clean:
+            time.sleep(MISSING_MOVIE_RESCUE_PACE_SECONDS)
+            continue
+
+        best = max(clean, key=lambda r: (r.get("seeders") or 0))
+        try:
+            req = urllib.request.Request(
+                f"{radarr_base}/api/v3/release",
+                data=json.dumps({"guid": best["guid"], "indexerId": best["indexerId"]}).encode(),
+                method="POST",
+                headers={"X-Api-Key": radarr_key, "Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=20)
+            grabbed += 1
+            results.append(
+                f"GRABBED '{movie.get('title', '?')}': "
+                f"'{best['title'][:70]}' ({best.get('seeders')} seeders)"
+            )
+        except Exception as e:
+            results.append(f"movie {movie_id}: ERROR grabbing '{best['title'][:60]}': {e}")
+
+        time.sleep(MISSING_MOVIE_RESCUE_PACE_SECONDS)
+
+    if not results:
+        return f"Missing-movie rescue: checked {checked}, nothing grabbable found"
+    return f"Missing-movie rescue: checked {checked}, grabbed {grabbed}:\n" + "\n".join(results)
+
+
 def trigger_missing_content_search():
-    """Companion to rescue_missing_episodes_via_direct_search() above for
-    Radarr's side, which doesn't have the same demonstrated rate-limit
-    problem (Radarr's Wanted list is small) -- its own built-in
-    "MissingMoviesSearch" bulk command is fine to keep using as-is. Runs
-    once a day (not every 30-min cycle) to stay polite to indexers and
-    avoid the kind of long-running command that has wedged Sonarr's queue
-    before (see the SeriesSearch-hang notes elsewhere in this file); the
-    existing stuck-command watchdog in arr-health-check.py already covers
-    recovery if either ever hangs."""
+    """Runs once a day (not every 30-min cycle) to stay polite to indexers
+    and avoid the kind of long-running command that has wedged Sonarr's
+    queue before (see the SeriesSearch-hang notes elsewhere in this file);
+    the existing stuck-command watchdog in arr-health-check.py already
+    covers recovery if either app's own commands ever hang.
+
+    This used to trigger Radarr's own built-in "MissingMoviesSearch" bulk
+    command directly, on the assumption that Radarr didn't share Sonarr's
+    demonstrated rate-limit problem ("Radarr's Wanted list is small... its
+    own built-in MissingMoviesSearch bulk command is fine to keep using
+    as-is"). Confirmed wrong live 2026-08-06 with "I, Robot" (2004) -- see
+    rescue_missing_movies_via_direct_search() above for the full story.
+    MissingMoviesSearch fires the same kind of rapid-fire, unpaced burst of
+    per-movie searches internally that MissingEpisodeSearch does, and is
+    exactly as capable of tripping an indexer's rate limit and cascading a
+    zero-grab result across every candidate in the burst. Radarr now gets
+    the same direct, paced, one-release-at-a-time treatment Sonarr already
+    had."""
     state = load_json_state(MISSING_SEARCH_STATE_PATH)
     now = datetime.now(timezone.utc)
     last_run = state.get("last_run")
@@ -572,16 +673,9 @@ def trigger_missing_content_search():
 
     results = []
     try:
-        req = urllib.request.Request(
-            f"{RADARR[1]}/api/v3/command",
-            data=json.dumps({"name": "MissingMoviesSearch"}).encode(),
-            method="POST",
-            headers={"X-Api-Key": RADARR[2], "Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=15)
-        results.append("Radarr: triggered MissingMoviesSearch")
+        results.append(rescue_missing_movies_via_direct_search())
     except Exception as e:
-        results.append(f"Radarr: ERROR triggering MissingMoviesSearch: {e}")
+        results.append(f"Radarr: ERROR in missing-movie rescue: {e}")
 
     try:
         results.append(rescue_missing_episodes_via_direct_search())

@@ -486,6 +486,45 @@ INDEXER_NAME_RE = re.compile(r"[Ii]ndexer ([A-Z0-9][\w. ]*?)(?:\s*\(Prowlarr\)|:
 RATE_LIMIT_WINDOW_SECONDS = 10 * 60  # matches this check's own 10-minute cadence
 
 
+def _detect_rate_limit_hits(base, key, now_utc):
+    """Shared by check_indexer_rate_limits() and rescue_rate_limited_grabs()
+    below -- scans an app's most recent log entries for the 429/"Grab
+    Limit" signature within RATE_LIMIT_WINDOW_SECONDS and pulls out which
+    indexer(s) it names. Returns (hits, who): hits is the list of matching
+    log entries (empty if none this window), who is a display string
+    naming the indexer(s) involved, or "an indexer" if the name couldn't be
+    extracted from any nearby log line."""
+    log = app_get(base, key, "/api/v3/log?pageSize=200&sortKey=time&sortDirection=descending")
+
+    hits = []
+    named_entries = []  # every recent entry, regardless of exact wording, to pull the indexer name from
+    for entry in log.get("records", []):
+        try:
+            ts = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
+        except (ValueError, KeyError):
+            continue
+        if (now_utc - ts).total_seconds() > RATE_LIMIT_WINDOW_SECONDS:
+            continue
+        named_entries.append(entry)
+        message = entry.get("message", "")
+        if "429" in message or "Grab Limit" in message:
+            hits.append(entry)
+
+    # The line that actually says "429"/"Grab Limit" is usually a raw
+    # HTTP-layer message with no indexer name in it at all -- the name
+    # only shows up on the neighbouring "Couldn't add release ... from
+    # Indexer X" line a few log entries away, so the name has to come
+    # from the whole recent window, not just the hit lines themselves.
+    indexer_names = set()
+    for entry in named_entries:
+        m = INDEXER_NAME_RE.search(entry.get("message", ""))
+        if m:
+            indexer_names.add(m.group(1).strip())
+    who = ", ".join(sorted(indexer_names)) if indexer_names else "an indexer"
+
+    return hits, who
+
+
 def check_indexer_rate_limits(state):
     """Sonarr/Radarr's own health page never flags this at all -- discovered
     live 2026-08-03 when a freshly-added movie's automatic on-add search
@@ -497,14 +536,25 @@ def check_indexer_rate_limits(state):
     nothing anywhere saying why -- not a health warning, not an error a
     non-technical family member would ever think to go looking for.
 
-    Scans each app's own recent log for that exact signature. Deliberately
-    does NOT retry immediately -- the indexer is (correctly) refusing more
-    requests right now, so hammering it again would just repeat the same
-    failure. The existing daily missing-content search in
-    arr-queue-cleaner.py already retries anything still missing once the
-    rate-limit window has reset on its own, so this is visibility-only,
-    deduped per hour so a rate-limit burst that spans several 10-minute
-    checks in a row is only logged once, not every cycle.
+    Scans each app's own recent log for that exact signature (via the
+    shared _detect_rate_limit_hits() helper above), deduped per hour so a
+    rate-limit burst spanning several 10-minute checks in a row is only
+    logged once, not every cycle.
+
+    Originally this was visibility-only, on the reasoning that the daily
+    missing-content search would pick anything still missing back up once
+    the rate-limit window reset on its own. Confirmed wrong for Radarr
+    specifically, live 2026-08-06: "I, Robot" (2004) tripped exactly this
+    signature against Knaben, ended up with zero grabs and a completely
+    empty /api/v3/history/movie, and Radarr never retries a Wanted item on
+    its own -- and at the time, the daily rescue in arr-queue-cleaner.py
+    just re-ran Radarr's own bulk MissingMoviesSearch command, which fires
+    the same kind of rapid-fire unpaced burst that caused the rate-limit in
+    the first place, so it could re-trip the exact breaker it was supposed
+    to be waiting out rather than actually fixing anything. See
+    rescue_rate_limited_grabs() below, which now acts on this same
+    detection immediately (a handful of paced, single-release grabs) rather
+    than waiting up to a day for the next cycle.
 
     Also: Knaben, LimeTorrents, Nyaa.si, and YTS all had conservative
     query/grab limits configured directly in Prowlarr the same day this was
@@ -519,39 +569,13 @@ def check_indexer_rate_limits(state):
 
     for name, base, key in APPS:
         try:
-            log = app_get(base, key, "/api/v3/log?pageSize=200&sortKey=time&sortDirection=descending")
+            hits, who = _detect_rate_limit_hits(base, key, now_utc)
         except Exception as e:
             results.append(f"{name} indexer rate-limit check: ERROR reading log: {e}")
             continue
 
-        hits = []
-        named_entries = []  # every recent entry, regardless of exact wording, to pull the indexer name from
-        for entry in log.get("records", []):
-            try:
-                ts = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
-            except (ValueError, KeyError):
-                continue
-            if (now_utc - ts).total_seconds() > RATE_LIMIT_WINDOW_SECONDS:
-                continue
-            named_entries.append(entry)
-            message = entry.get("message", "")
-            if "429" in message or "Grab Limit" in message:
-                hits.append(entry)
-
         if not hits:
             continue
-
-        # The line that actually says "429"/"Grab Limit" is usually a raw
-        # HTTP-layer message with no indexer name in it at all -- the name
-        # only shows up on the neighbouring "Couldn't add release ... from
-        # Indexer X" line a few log entries away, so the name has to come
-        # from the whole recent window, not just the hit lines themselves.
-        indexer_names = set()
-        for entry in named_entries:
-            m = INDEXER_NAME_RE.search(entry.get("message", ""))
-            if m:
-                indexer_names.add(m.group(1).strip())
-        who = ", ".join(sorted(indexer_names)) if indexer_names else "an indexer"
 
         ledger_key = f"{hour_bucket}:{name}:{who}"
         if ledger_key in ledger:
@@ -561,11 +585,215 @@ def check_indexer_rate_limits(state):
         results.append(
             f"{name}: {who} is rate-limiting requests ({len(hits)} failed grab/search attempt(s) in the "
             f"last {RATE_LIMIT_WINDOW_SECONDS // 60}min) -- searches will keep finding releases but failing "
-            f"to grab them until the indexer's own limit window resets. Nothing to fix by hand; the daily "
-            f"missing-content search will pick up anything still missing automatically once it clears."
+            f"to grab them until the indexer's own limit window resets. rescue_rate_limited_grabs() actively "
+            f"retries anything with zero grab history so far; the daily missing-content search in "
+            f"arr-queue-cleaner.py covers anything still left after that."
         )
 
     state["rate_limit_ledger"] = ledger
+    return results
+
+
+RATE_LIMIT_RESCUE_MAX_PER_RUN = 5  # small on purpose -- see docstring below
+RATE_LIMIT_RESCUE_PACE_SECONDS = 5  # gap between each release-check+grab
+# How long a title stays exempt from being auto-rescued again after one
+# attempt, success or failure. A couple of hours is enough for a genuine
+# indexer disable window (Knaben's was ~1 minute on 2026-08-06, but the
+# reasoning holds for a longer one too) to have long since cleared, while
+# still being short enough that a title isn't stuck waiting a full day for
+# the next missing-content cycle.
+RATE_LIMIT_RESCUE_COOLDOWN_SECONDS = 2 * 60 * 60
+RATE_LIMIT_RESCUE_STATE_KEY = "rate_limit_rescue_ledger"
+
+
+def _sonarr_zero_history_candidates(base, key):
+    """Series-level detection mirrors check_orphaned_additions() in
+    arr-queue-cleaner.py exactly: monitored, something has aired, zero
+    episode files, and zero history ever for the whole series. Deliberately
+    does NOT apply that check's ORPHAN_MIN_AGE_DAYS (3-day) age gate --
+    that gate exists to give a freshly-added show time to be searched
+    normally before flagging it as a slow-moving problem needing a human;
+    a rate-limit burst is the opposite, a fast-moving problem that needs to
+    catch a fresh victim within minutes, not days.
+
+    Returns Wanted-episode records (not series) -- a release/grab is always
+    per-episode, not per-series, so once a series is confirmed to have zero
+    history, its currently-missing episodes are pulled from Sonarr's own
+    wanted/missing list for the caller to actually act on."""
+    series_list = app_get(base, key, "/api/v3/series")
+    zero_history_series_ids = set()
+    for s in series_list:
+        if not s.get("monitored"):
+            continue
+        stats = s.get("statistics", {})
+        if stats.get("episodeFileCount", 0) > 0:
+            continue
+        if stats.get("episodeCount", 0) == 0:
+            continue  # nothing has aired yet -- a genuinely new show, not this bug class
+        try:
+            history = app_get(base, key, f"/api/v3/history/series?seriesId={s['id']}")
+        except Exception:
+            continue
+        if history:
+            continue  # has SOME history -- a real availability gap, not zero-grab-ever
+        zero_history_series_ids.add(s["id"])
+
+    if not zero_history_series_ids:
+        return []
+
+    wanted = app_get(base, key, "/api/v3/wanted/missing?pageSize=1000")
+    return [
+        e for e in wanted.get("records", [])
+        if e.get("seriesId") in zero_history_series_ids
+    ]
+
+
+def _radarr_zero_history_candidates(base, key):
+    """Movie-level equivalent of _sonarr_zero_history_candidates() above:
+    monitored, available, missing a file, and zero history ever -- exactly
+    the shape "I, Robot" (2004) was in on 2026-08-06."""
+    movies = app_get(base, key, "/api/v3/movie")
+    candidates = []
+    for m in movies:
+        if not m.get("monitored") or m.get("hasFile"):
+            continue
+        if not m.get("isAvailable"):
+            continue
+        try:
+            history = app_get(base, key, f"/api/v3/history/movie?movieId={m['id']}")
+        except Exception:
+            continue
+        if history:
+            continue
+        candidates.append(m)
+    return candidates
+
+
+def rescue_rate_limited_grabs(state):
+    """Active companion to check_indexer_rate_limits() above. Proven live
+    2026-08-06: "I, Robot" (2004) was added to Radarr, which immediately
+    auto-searched and found ~14 good candidate releases, all from indexer
+    Knaben (via Prowlarr). Radarr's own ProcessDownloadDecisions cascades
+    grab attempts across candidates in rapid succession (multiple per
+    second) as earlier ones fail. A couple of early failures tripped
+    Prowlarr's own circuit-breaker, which disabled Knaben for about a
+    minute -- and every OTHER candidate release still queued in that same
+    burst then failed too, for the same reason, not because anything was
+    genuinely wrong with them. The movie ended up with zero successful
+    grabs and a completely empty /api/v3/history/movie, and Radarr never
+    retries a Wanted item on its own once this happens, so it just sat in
+    Wanted invisibly. Manually submitting exactly ONE grab request for the
+    single best candidate once the disable window cleared (POST
+    /api/v3/release with {guid, indexerId} -- NOT a fresh search, which
+    would just cascade through the whole candidate list again and re-trip
+    the breaker) fixed it immediately.
+
+    check_indexer_rate_limits() above only logs when this happens, on the
+    reasoning that the existing daily missing-content search would pick
+    anything still missing back up once the rate-limit window reset. That
+    reasoning was wrong for Radarr specifically -- the daily rescue used to
+    just re-run Radarr's bulk MissingMoviesSearch command, which fires the
+    same kind of rapid-fire unpaced burst that caused the rate-limit in the
+    first place (now fixed separately, see
+    rescue_missing_movies_via_direct_search() in arr-queue-cleaner.py), and
+    even with that fixed, a freshly-stuck title still had to wait up to a
+    day for the next cycle. This closes that gap: when a burst is detected
+    for an app (same signature, same RATE_LIMIT_WINDOW_SECONDS window,
+    reusing _detect_rate_limit_hits()), it finds titles with literally zero
+    grab history ever (mirroring check_orphaned_additions()'s detection in
+    arr-queue-cleaner.py, minus its 3-day age gate -- see
+    _sonarr_zero_history_candidates()/_radarr_zero_history_candidates()
+    above) and rescues a handful of them the same way the I, Robot fix
+    worked by hand: one release check, one single-release grab, paced
+    several seconds apart, capped small per run -- never a fresh burst of
+    our own that could re-trip the exact breaker this exists to work
+    around. A per-title ledger with a couple-hours cooldown stops the same
+    title being retried every 10-minute cycle if the first attempt found
+    nothing grabbable yet."""
+    results = []
+    now_utc = datetime.now(timezone.utc)
+    now_ts = time.time()
+
+    ledger = state.get(RATE_LIMIT_RESCUE_STATE_KEY, {})
+    # Drop anything past its cooldown so the ledger doesn't grow forever.
+    new_ledger = {
+        k: v for k, v in ledger.items()
+        if now_ts - v < RATE_LIMIT_RESCUE_COOLDOWN_SECONDS
+    }
+
+    for name, base, key in APPS:
+        try:
+            hits, who = _detect_rate_limit_hits(base, key, now_utc)
+        except Exception as e:
+            results.append(f"{name} rate-limit rescue: ERROR reading log: {e}")
+            continue
+        if not hits:
+            continue
+
+        try:
+            if name == "Sonarr":
+                candidates = _sonarr_zero_history_candidates(base, key)
+            else:
+                candidates = _radarr_zero_history_candidates(base, key)
+        except Exception as e:
+            results.append(f"{name} rate-limit rescue: ERROR listing zero-history candidates: {e}")
+            continue
+
+        checked = 0
+        for item in candidates:
+            if checked >= RATE_LIMIT_RESCUE_MAX_PER_RUN:
+                break
+
+            if name == "Sonarr":
+                entity_id = item["id"]
+                ledger_key = f"sonarr:{entity_id}"
+                release_path = f"/api/v3/release?episodeId={entity_id}"
+                display = (
+                    f"S{item.get('seasonNumber')}E{item.get('episodeNumber')} of "
+                    f"'{item.get('series', {}).get('title', '?')}'"
+                )
+            else:
+                entity_id = item["id"]
+                ledger_key = f"radarr:{entity_id}"
+                release_path = f"/api/v3/release?movieId={entity_id}"
+                display = f"'{item.get('title', '?')}'"
+
+            if ledger_key in new_ledger:
+                # Anything still in new_ledger already survived the
+                # cooldown filter above, i.e. was attempted within the last
+                # RATE_LIMIT_RESCUE_COOLDOWN_SECONDS -- don't retry-loop it.
+                continue
+
+            checked += 1
+            try:
+                releases = app_get(base, key, release_path)
+            except Exception as e:
+                results.append(f"{name} rate-limit rescue: ERROR checking releases for {display}: {e}")
+                new_ledger[ledger_key] = now_ts
+                time.sleep(RATE_LIMIT_RESCUE_PACE_SECONDS)
+                continue
+
+            clean = [r for r in releases if not r.get("rejections")]
+            new_ledger[ledger_key] = now_ts  # attempted this cycle regardless of outcome
+
+            if not clean:
+                time.sleep(RATE_LIMIT_RESCUE_PACE_SECONDS)
+                continue
+
+            best = max(clean, key=lambda r: (r.get("seeders") or 0))
+            try:
+                app_post(base, key, "/api/v3/release", {"guid": best["guid"], "indexerId": best["indexerId"]})
+                results.append(
+                    f"{name}: rate-limit rescue GRABBED {display}: '{best['title'][:70]}' "
+                    f"({best.get('seeders')} seeders) -- {who} rate-limited this app in the last "
+                    f"{RATE_LIMIT_WINDOW_SECONDS // 60}min and this had zero grab history ever"
+                )
+            except Exception as e:
+                results.append(f"{name} rate-limit rescue: ERROR grabbing '{best['title'][:60]}' for {display}: {e}")
+
+            time.sleep(RATE_LIMIT_RESCUE_PACE_SECONDS)
+
+    state[RATE_LIMIT_RESCUE_STATE_KEY] = new_ledger
     return results
 
 
@@ -589,6 +817,7 @@ def main():
         ("Command queue check", lambda: check_stuck_commands(state, now)),
         ("App health check", lambda: check_app_health(state)),
         ("Indexer rate-limit check", lambda: check_indexer_rate_limits(state)),
+        ("Rate-limited grab rescue", lambda: rescue_rate_limited_grabs(state)),
     ):
         try:
             results.extend(fn())
